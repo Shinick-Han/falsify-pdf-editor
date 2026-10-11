@@ -2,7 +2,7 @@
 // pinned sources (module root or FALSIFY_EDITOR_SOURCE_ROOT) and a prepared
 // .runtime are available, and are skipped otherwise.
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join, parse } from "node:path";
 import { test } from "node:test";
@@ -294,6 +294,81 @@ test("CLI resolves input relative to the request and writes output only after se
   const notOk = async () => ({ pdf: bytes("%PDF-new"), report: { ok: false, selfCheck: { status: "failed" } } });
   assert.equal(await main([req, "--out", join(dir, "g.pdf"), "--report", join(dir, "g.json")], { ...quiet, editPdf: notOk }), 1);
   assert.ok(!existsSync(join(dir, "g.pdf")));
+});
+
+test("CLI never overwrites an existing report without --overwrite and edits nothing", async () => {
+  const { dir, req } = cliFixture();
+  const report = join(dir, "r.json");
+  writeFileSync(report, "keep-report");
+  let calls = 0;
+  const okStub = async () => { calls++; return { pdf: bytes("%PDF-new"), report: { ok: true, selfCheck: { status: "passed" } } }; };
+  const failStub = async () => { calls++; throw new EditError("SELF_CHECK_FAILED", "fail"); };
+  assert.equal(await main([req, "--out", join(dir, "o.pdf"), "--report", report], { ...quiet, editPdf: okStub }), 2);
+  assert.equal(await main([req, "--out", join(dir, "o.pdf"), "--report", report], { ...quiet, editPdf: failStub }), 2);
+  assert.equal(calls, 0);
+  assert.equal(readFileSync(report, "utf8"), "keep-report");
+  assert.ok(!existsSync(join(dir, "o.pdf")));
+  // Existing output rejected: report destination is untouched too.
+  writeFileSync(join(dir, "exists.pdf"), "keep");
+  assert.equal(await main([req, "--out", join(dir, "exists.pdf"), "--report", join(dir, "new.json")], { ...quiet, editPdf: okStub }), 2);
+  assert.equal(calls, 0);
+  assert.ok(!existsSync(join(dir, "new.json")));
+});
+
+test("CLI --overwrite keeps source protections and replaces the intended report and output", async () => {
+  const { dir, req } = cliFixture();
+  const src = join(dir, "in", "paper.pdf");
+  const okStub = async () => ({ pdf: bytes("%PDF-new"), report: { ok: true, selfCheck: { status: "passed" } } });
+  assert.equal(await main([req, "--out", src, "--report", join(dir, "r.json"), "--overwrite"], { ...quiet, editPdf: okStub }), 2);
+  assert.equal(await main([req, "--out", join(dir, "o.pdf"), "--report", src, "--overwrite"], { ...quiet, editPdf: okStub }), 2);
+  assert.equal(await main([req, "--out", join(dir, "o.pdf"), "--report", req, "--overwrite"], { ...quiet, editPdf: okStub }), 2);
+  assert.equal(readFileSync(src, "utf8"), "%PDF-source");
+  assert.ok(readFileSync(req, "utf8").includes("paper.pdf"));
+  assert.ok(!existsSync(join(dir, "o.pdf")) && !existsSync(join(dir, "r.json")));
+  writeFileSync(join(dir, "o.pdf"), "old-out");
+  writeFileSync(join(dir, "r.json"), "old-report");
+  assert.equal(await main([req, "--out", join(dir, "o.pdf"), "--report", join(dir, "r.json"), "--overwrite"], { ...quiet, editPdf: okStub }), 0);
+  assert.equal(readFileSync(join(dir, "o.pdf"), "utf8"), "%PDF-new");
+  assert.equal(JSON.parse(readFileSync(join(dir, "r.json"), "utf8")).selfCheck.status, "passed");
+  const failStub = async () => { const e = new EditError("SELF_CHECK_FAILED", "fail"); e.report = { ok: false }; throw e; };
+  assert.equal(await main([req, "--out", join(dir, "o.pdf"), "--report", join(dir, "r.json"), "--overwrite"], { ...quiet, editPdf: failStub }), 1);
+  assert.equal(readFileSync(join(dir, "o.pdf"), "utf8"), "%PDF-new");
+  assert.equal(JSON.parse(readFileSync(join(dir, "r.json"), "utf8")).error.code, "SELF_CHECK_FAILED");
+});
+
+test("CLI publication never touches a pre-existing .tmp-PID staging file or symlink", async (t) => {
+  const { dir, req } = cliFixture();
+  const out = join(dir, "o.pdf");
+  const report = join(dir, "r.json");
+  const decoy = `${out}.tmp-${process.pid}`;
+  writeFileSync(decoy, "decoy");
+  const target = join(dir, "victim.txt");
+  writeFileSync(target, "victim");
+  const link = `${report}.tmp-${process.pid}`;
+  let haveLink = "file";
+  try {
+    symlinkSync(target, link, "file");
+  } catch {
+    // Unprivileged Windows: a directory junction is still a link at the staging path.
+    mkdirSync(join(dir, "victim-dir"));
+    writeFileSync(join(dir, "victim-dir", "keep.txt"), "victim");
+    symlinkSync(join(dir, "victim-dir"), link, "junction");
+    haveLink = "junction";
+  }
+  const okStub = async () => ({ pdf: bytes("%PDF-new"), report: { ok: true, selfCheck: { status: "passed" } } });
+  assert.equal(await main([req, "--out", out, "--report", report], { ...quiet, editPdf: okStub }), 0);
+  assert.equal(readFileSync(out, "utf8"), "%PDF-new");
+  assert.equal(JSON.parse(readFileSync(report, "utf8")).ok, true);
+  assert.equal(readFileSync(decoy, "utf8"), "decoy");
+  assert.equal(readFileSync(target, "utf8"), "victim");
+  assert.ok(lstatSync(link).isSymbolicLink());
+  const entries = ["in", "o.pdf", "o.pdf.tmp-" + process.pid, "r.json", "r.json.tmp-" + process.pid, "victim.txt"];
+  if (haveLink === "junction") {
+    entries.push("victim-dir");
+    assert.deepEqual(readdirSync(join(dir, "victim-dir")), ["keep.txt"]);
+    t.diagnostic("file symlinks not permitted; used a directory junction at the staging path");
+  }
+  assert.deepEqual(readdirSync(dir).sort(), entries.sort());
 });
 
 // ---------- runtime preparation safety ----------

@@ -3,7 +3,8 @@
 //        [--overwrite] [--engine-log]
 // Exit codes: 0 self-check passed (independent QA still pending),
 // 1 definite edit/self-check failure, 2 usage, request or I/O error.
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EditError, LIMITS, editPdf } from "./editor.mjs";
@@ -51,6 +52,16 @@ function canonical(path) {
   return process.platform === "win32" || process.platform === "darwin" ? real.toLowerCase() : real;
 }
 
+// True for any directory entry, including dangling symlinks.
+function occupied(path) {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function loadRequest(requestPath) {
   const abs = resolve(requestPath);
   let st;
@@ -78,14 +89,29 @@ export function checkPaths({ requestPath, inputPath, out, report, overwrite }) {
   if (ids.report === ids.input) throw new CliError("OUTPUT_IS_SOURCE", "Report path must differ from the input PDF");
   if (ids.out === ids.request || ids.report === ids.request) throw new CliError("OUTPUT_IS_SOURCE", "Output paths must differ from the request file");
   if (ids.out === ids.report) throw new CliError("USAGE", "Output and report paths must differ");
-  if (!overwrite && existsSync(out)) throw new CliError("OUTPUT_EXISTS", "Output PDF already exists; pass --overwrite to replace it");
+  if (!overwrite && occupied(out)) throw new CliError("OUTPUT_EXISTS", "Output PDF already exists; pass --overwrite to replace it");
+  if (!overwrite && occupied(report)) throw new CliError("REPORT_EXISTS", "Report already exists; pass --overwrite to replace it");
 }
 
 function writeAtomic(path, bytes) {
-  mkdirSync(dirname(resolve(path)), { recursive: true });
-  const tmp = resolve(path) + ".tmp-" + process.pid;
-  writeFileSync(tmp, bytes);
-  renameSync(tmp, resolve(path));
+  const abs = resolve(path);
+  mkdirSync(dirname(abs), { recursive: true });
+  // Exclusively created, unpredictable staging file: never reuses or follows a pre-existing path.
+  const tmp = `${abs}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+  const fd = openSync(tmp, "wx");
+  try {
+    try {
+      writeFileSync(fd, bytes);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, abs);
+  } catch (e) {
+    try {
+      unlinkSync(tmp);
+    } catch {}
+    throw e;
+  }
 }
 
 export async function main(argv, deps = {}) {
