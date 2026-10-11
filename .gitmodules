@@ -1,0 +1,6 @@
+[submodule "upstream/bentopdf"]
+	path = upstream/bentopdf
+	url = https://github.com/alam00000/bentopdf.git
+[submodule "upstream/engine"]
+	path = upstream/engine
+	url = https://github.com/alam00000/bentopdf-pdfium-viewer.git
