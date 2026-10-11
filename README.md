@@ -55,9 +55,11 @@ Use only documents you are entitled to edit. Preserve the clean original, keep e
 
 - Unique, whitespace-normalized Before matching, without fuzzy relocation or silently shortening After.
 - Preserves the existing surgical path for short edits where possible.
-- Experimental column-bounded reflow, source-order restoration, and protection of identifiable page-edge content.
+- Experimental column-bounded reflow, source-object-slot diagnostics, and protection of identifiable page-edge content.
 - Saved-document text/geometry checks are same-PDFium checks, not independent rendering or external BLUE validation.
 - Unsupported or uncertain layouts require explicit diagnostics, not false success. Multi-column text, scanned pages, tables, equations, mixed fonts, missing glyphs, rotated/cropped pages and pagination are not universally supported.
+
+**Known blocker:** restoring the PDFium object-list index does not necessarily restore the saved content-stream order. Re-laid-out text can still extract at the end of the page. These outputs fail the mandatory saved-text check; the diagnostic is not a claim of an implemented reading-order fix. Full stream-order repair and pagination remain unfinished.
 
 ## Source and notices
 

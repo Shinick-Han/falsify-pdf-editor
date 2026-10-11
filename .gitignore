@@ -1,5 +1,7 @@
 node_modules/
 .runtime/
+.runtime-staging-*/
+.runtime-backup-*/
 output/
 tmp/
 __pycache__/
