@@ -61,18 +61,68 @@ git -C upstream/engine cat-file blob 813903c93c758dfb8df46dbd34ace3b7f7a8538b:pa
 - **Verified:** the runtime files are byte-identical to the files committed in
   the public engine repository at the pinned commit. BentoPDF's vendored
   tarball for the same engine revision carries the same WASM and JS.
-- **Not verified:** that those committed binaries are reproducible from the
-  pinned C++ sources. This project has **not** run a full WebAssembly rebuild,
-  produced its own WASM hash, or compared bit-for-bit output. Source/header
-  syntax probes on a host compiler and successful application of the
-  engine's `security-fixes` and `editcore-pdfium` patches to the pinned PDFium
-  are partial checks only, not a build.
+- **Rebuilt once from source:** one local build with
+  [`scripts/rebuild-wasm.sh`](../scripts/rebuild-wasm.sh) (see below) of the
+  unmodified pinned sources produced `pdfium.wasm` and `pdfium.js` that are
+  byte-identical to the committed blobs (SHA-256 `1860f0b3…a893ce` and
+  `6e6989a9…7bb3eb`). This is one build on one host, not a demonstration that
+  every build or every host reproduces these bytes.
+- **Still not shipped:** the module runs the committed upstream binary. A
+  locally rebuilt or patched binary is a separate artifact and is not used
+  unless it is explicitly selected and tested.
 
 The corresponding source for the binaries is the engine at the pinned commit:
 editcore C++ in `packages/pdfium/build/code/editcore/`, glue code in
 `packages/pdfium/build/code/cpp/`, HarfBuzz in
 `packages/pdfium/build/code/harfbuzz/`, PDFium patches in
 `packages/pdfium/build/patch/`, and PDFium itself in the nested submodule.
+
+## Local source rebuild (`scripts/rebuild-wasm.sh`)
+
+`scripts/rebuild-wasm.sh` translates the engine's containerised build to one
+dedicated directory on a Linux host, without Docker, `sudo`, global apt
+packages or global Git configuration. It was run on WSL Ubuntu with the build
+directory on the Linux ext4 file system (not `/tmp`, not `/mnt/c`).
+
+```sh
+export BUILD_ROOT=$(mktemp -d "$HOME/editor-wasm-build.XXXXXX")
+scripts/rebuild-wasm.sh fetch toolchain sync prepare configure lib
+SNAPSHOT=baseline scripts/rebuild-wasm.sh exports link snapshot
+# optional extra PDFium patch, then an incremental rebuild:
+PATCH_REPO=pdfium PATCHES=/path/to/fix.patch scripts/rebuild-wasm.sh patch lib exports link
+SNAPSHOT=patched CANDIDATE_DIR=/new/empty/dir scripts/rebuild-wasm.sh snapshot
+scripts/rebuild-wasm.sh inventory
+```
+
+What it pins and isolates:
+
+| Input | Pin |
+|---|---|
+| Engine | `813903c93c758dfb8df46dbd34ace3b7f7a8538b`, fetched by commit and checked against the PDFium gitlink |
+| PDFium | `fce2b000cc7a9e2cabc92db41cd57ca03233f07d` |
+| emsdk | `3.1.70` (emsdk `2514ec73…`, emscripten `b53978ee…`, clang 20 `f52b8956…`, bundled Node 20.18.0) |
+| depot_tools | `6235028c6b18b73e68f5414f935ec537a25ea51a` (from PDFium `DEPS`, self-update disabled) |
+| GN / Ninja | from PDFium `DEPS`: gn `bd3356ac13f4`, ninja 1.12.1 |
+| PDFium third-party deps | `gclient sync --no-history --shallow --nohooks --deps=builder`; `inventory` records `gclient revinfo` |
+
+The script uses a fixed `PATH`, `GIT_CONFIG_GLOBAL=/dev/null` with
+`core.autocrlf=false`, and keeps every cache inside `BUILD_ROOT`. It refuses a
+`BUILD_ROOT` that is `/`, a system directory, `$HOME`, a Windows mount, not
+owned by the user, or not marked with `.editor-wasm-build-root` (written on
+first use of an empty directory). It never deletes recursively, refuses to
+move a dirty or foreign checkout, writes only known generated files in
+`build/wasm`, never reuses a snapshot name and never overwrites an existing
+candidate binary.
+
+Measured on a 32-core / 30 GB WSL host at `-j8`: dependency sync about
+3 minutes, the full `libembedpdf.a` about 2 minutes, the ESM link about
+1 minute; about 8 GB of disk in total. The ESM output only is built; the
+engine's CommonJS variant (`compile.sh`) is not.
+
+Differences from the upstream container route: no `install-build-deps.sh`
+(not needed for the WebAssembly target), no NodeSource Node.js (emsdk's Node
+runs the export generators), no Rust/watchexec, and Python is the host's
+`python3` for emscripten and depot_tools' own bundled Python for gclient.
 
 ## Upstream rebuild route (Linux / Docker, not executed here)
 
