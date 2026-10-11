@@ -1,0 +1,365 @@
+// Explicit, all-or-nothing PDF text edits on the pinned BentoPDF editcore.
+//
+// Alignment and run-preserving rebuild are derived from the earlier
+// proof-of-concept adapter (AGPL-3.0-only, see notices). Every requested edit
+// must match exactly once on its page after whitespace normalization; there
+// is no fuzzy relocation, implicit selection or shortening of After text.
+// All pages are planned against unchanged snapshots before any commit.
+import { loadRuntime } from "./runtime.mjs";
+
+export const LIMITS = Object.freeze({
+  maxFileBytes: 64 * 1024 * 1024,
+  maxEdits: 64,
+  maxTextChars: 4000,
+  maxIdChars: 64,
+});
+
+export class EditError extends Error {
+  constructor(code, message, details = {}) {
+    super(message);
+    this.name = "EditError";
+    this.code = code;
+    this.details = details;
+  }
+}
+
+const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const EDIT_KEYS = new Set(["id", "pageIndex", "before", "after"]);
+const REQUEST_KEYS = new Set(["sourceBytes", "edits", "reflow"]);
+
+export const normalizeText = (s) => s.replace(/\s+/g, " ");
+
+// Validates shape and budgets only; page ranges need the opened document.
+export function validateRequest(request, limits = LIMITS) {
+  const bad = (msg, details) => {
+    throw new EditError("INVALID_REQUEST", msg, details);
+  };
+  if (!request || typeof request !== "object" || Array.isArray(request)) bad("Request must be an object");
+  for (const k of Object.keys(request)) if (!REQUEST_KEYS.has(k)) bad(`Unknown request field: ${k}`);
+  const { sourceBytes, edits, reflow } = request;
+  if (!(sourceBytes instanceof Uint8Array)) bad("sourceBytes must be a Uint8Array");
+  if (sourceBytes.length === 0) bad("sourceBytes is empty");
+  if (sourceBytes.length > limits.maxFileBytes) bad(`sourceBytes exceeds ${limits.maxFileBytes} bytes`);
+  if (typeof reflow !== "boolean") bad("reflow must be a boolean");
+  if (!Array.isArray(edits)) bad("edits must be an array");
+  if (edits.length > limits.maxEdits) bad(`At most ${limits.maxEdits} edits are allowed`);
+  const seen = new Set();
+  edits.forEach((e, index) => {
+    if (!e || typeof e !== "object" || Array.isArray(e)) bad(`Edit #${index} must be an object`, { index });
+    for (const k of Object.keys(e)) if (!EDIT_KEYS.has(k)) bad(`Edit #${index} has unknown field: ${k}`, { index });
+    if (typeof e.id !== "string" || e.id.length > limits.maxIdChars || !ID_RE.test(e.id)) {
+      bad(`Edit #${index} id must match ${ID_RE} and be at most ${limits.maxIdChars} characters`, { index });
+    }
+    if (seen.has(e.id)) bad(`Duplicate edit id: ${e.id}`, { id: e.id });
+    seen.add(e.id);
+    if (!Number.isInteger(e.pageIndex) || e.pageIndex < 0) bad(`Edit ${e.id} pageIndex must be a non-negative integer`, { id: e.id });
+    if (typeof e.before !== "string" || e.before.trim() === "") bad(`Edit ${e.id} before must be non-empty text`, { id: e.id });
+    if (typeof e.after !== "string") bad(`Edit ${e.id} after must be a string`, { id: e.id });
+    if (e.before.length > limits.maxTextChars || e.after.length > limits.maxTextChars) {
+      bad(`Edit ${e.id} text exceeds ${limits.maxTextChars} characters`, { id: e.id });
+    }
+  });
+  return { sourceBytes, edits: edits.map((e) => ({ id: e.id, pageIndex: e.pageIndex, before: e.before, after: e.after })), reflow };
+}
+
+// ---------- alignment (PoC-derived) ----------
+
+function pageIndexMap(paras) {
+  const chars = [];
+  paras.forEach((p, pi) => {
+    if (pi > 0) chars.push({ ch: "\n", pi: -1 });
+    p.runs.forEach((r, ri) => {
+      for (let o = 0; o < r.text.length; o++) chars.push({ ch: r.text[o], pi, ri, o });
+    });
+  });
+  return chars;
+}
+
+function normalizeChars(chars) {
+  let norm = "";
+  const map = [];
+  for (let i = 0; i < chars.length; i++) {
+    if (/\s/.test(chars[i].ch)) {
+      let j = i;
+      while (j + 1 < chars.length && /\s/.test(chars[j + 1].ch)) j++;
+      norm += " ";
+      map.push([i, j]);
+      i = j;
+    } else {
+      norm += chars[i].ch;
+      map.push([i, i]);
+    }
+  }
+  return { norm, map };
+}
+
+function findAll(norm, needle) {
+  const hits = [];
+  for (let k = norm.indexOf(needle); k >= 0; k = norm.indexOf(needle, k + 1)) hits.push(k);
+  return hits;
+}
+
+export function rebuildRuns(para, del, inserts) {
+  const out = [];
+  para.runs.forEach((r, ri) => {
+    let t = "";
+    for (let o = 0; o <= r.text.length; o++) {
+      for (const ins of inserts) if (ins.ri === ri && ins.o === o) t += ins.text;
+      if (o < r.text.length && !del.has(ri + ":" + o)) t += r.text[o];
+    }
+    out.push({ ...r, text: t, rgba: r.rgba >>> 0, sourceIndex: ri });
+  });
+  const kept = out.filter((r) => r.text.length > 0);
+  return kept.length ? kept : out.slice(0, 1);
+}
+
+// Plans all edits of one page against an unchanged paragraph snapshot.
+// Returns { failures, plans, perPara }; failures carry no document text.
+export function planPageEdits(paras, edits) {
+  const chars = pageIndexMap(paras);
+  const { norm, map } = normalizeChars(chars);
+  const failures = [];
+  const spans = [];
+  const plans = [];
+  for (const e of edits) {
+    const needle = normalizeText(e.before);
+    const hits = findAll(norm, needle);
+    if (hits.length !== 1) {
+      failures.push({ id: e.id, pageIndex: e.pageIndex, code: hits.length ? "AMBIGUOUS_MATCH" : "NOT_FOUND", hits: hits.length });
+      continue;
+    }
+    const a = map[hits[0]][0];
+    const b = map[hits[0] + needle.length - 1][1];
+    const overlap = spans.find((s) => !(b < s.a || a > s.b));
+    if (overlap) {
+      failures.push({ id: e.id, pageIndex: e.pageIndex, code: "OVERLAPPING_EDITS", with: overlap.id });
+      continue;
+    }
+    spans.push({ a, b, id: e.id });
+    const span = chars.slice(a, b + 1).filter((c) => c.pi >= 0);
+    const touched = [...new Set(span.map((c) => c.pi))];
+    const locked = touched.filter((pi) => paras[pi].editable === false);
+    if (locked.length) {
+      failures.push({ id: e.id, pageIndex: e.pageIndex, code: "NOT_EDITABLE", paragraphIds: locked.map((pi) => paras[pi].id) });
+      continue;
+    }
+    const lastPi = touched[touched.length - 1];
+    plans.push({
+      edit: e,
+      span,
+      touched,
+      insertAt: span.find((c) => c.pi === lastPi),
+      noop: normalizeText(e.after) === needle,
+    });
+  }
+  // Paragraph mutations, built only from accepted, non-noop plans.
+  const perPara = new Map();
+  for (const p of plans) {
+    if (p.noop) continue;
+    for (const c of p.span) {
+      if (!perPara.has(c.pi)) perPara.set(c.pi, { del: new Set(), inserts: [] });
+      perPara.get(c.pi).del.add(c.ri + ":" + c.o);
+    }
+    perPara.get(p.insertAt.pi).inserts.push({ ri: p.insertAt.ri, o: p.insertAt.o, text: p.edit.after });
+  }
+  return { failures, plans, perPara };
+}
+
+// Paragraph ids are reassigned on every buildModel(), so snapshots compare
+// text, run structure and geometry by paragraph order instead.
+function snapshotKey(paras) {
+  const box = (b) => (b ? [b.x, b.top, b.w, b.h].map((v) => Math.round(v * 100)).join(",") : "-");
+  return paras.map((p) => box(p.box) + "|" + p.runs.map((r) => r.text).join("\u0000")).join("\n");
+}
+
+function groupByPage(edits) {
+  const byPage = new Map();
+  for (const e of edits) byPage.set(e.pageIndex, [...(byPage.get(e.pageIndex) || []), e]);
+  return [...byPage.entries()].sort((x, y) => x[0] - y[0]);
+}
+
+async function loadQuality(override) {
+  if (override) return override;
+  try {
+    return await import("./quality.mjs");
+  } catch (err) {
+    throw new EditError("QUALITY_UNAVAILABLE", "Quality module src/quality.mjs could not be loaded", { cause: err.code ?? err.name });
+  }
+}
+
+// Captures console output from the upstream engine. Text is kept only when
+// the caller opted in, because engine messages may quote document content.
+function captureConsole(keepText) {
+  const saved = { warn: console.warn, error: console.error, log: console.log };
+  const entries = [];
+  let count = 0;
+  const sink = (level) => (...args) => {
+    count++;
+    if (keepText) entries.push(level + ": " + args.map(String).join(" "));
+  };
+  console.warn = sink("warn");
+  console.error = sink("error");
+  console.log = sink("log");
+  return {
+    restore() {
+      Object.assign(console, saved);
+      return keepText ? { count, entries } : { count };
+    },
+  };
+}
+
+/**
+ * editPdf({ sourceBytes, edits, reflow }, options?) => { pdf, report }
+ *
+ * options: sourceRoot, runtimeDir, includeEngineLog (default false),
+ * quality / engineFactory (test seams).
+ * Throws EditError on any definite failure; err.report carries diagnostics.
+ */
+export async function editPdf(request, options = {}) {
+  const { sourceBytes, edits, reflow } = validateRequest(request, options.limits ?? LIMITS);
+  const quality = await loadQuality(options.quality);
+  for (const fn of ["capturePageLayout", "repairPageLayout", "inspectSavedPdf"]) {
+    if (typeof quality[fn] !== "function") throw new EditError("QUALITY_UNAVAILABLE", `Quality module lacks ${fn}`);
+  }
+  let engineFactory = options.engineFactory;
+  let runtimeInfo = options.runtimeInfo ?? null;
+  if (!engineFactory) {
+    const rt = await loadRuntime({ sourceRoot: options.sourceRoot, runtimeDir: options.runtimeDir });
+    engineFactory = rt.engineFactory;
+    runtimeInfo = rt.info;
+  }
+
+  const report = {
+    ok: false,
+    status: "failed",
+    reflow,
+    runtime: runtimeInfo,
+    edits: edits.map((e) => ({ id: e.id, pageIndex: e.pageIndex, status: "pending" })),
+    pages: [],
+    repairs: [],
+    warnings: [],
+    selfCheck: { status: "not-run" },
+    independentQA: { status: "pending", note: "Same-engine self-check only; independent QA is still required." },
+  };
+  const editReport = new Map(report.edits.map((r) => [r.id, r]));
+  const fail = (code, message, details) => {
+    const err = new EditError(code, message, details);
+    err.report = report;
+    return err;
+  };
+
+  const logCapture = captureConsole(!!options.includeEngineLog);
+  let engine;
+  let pdf;
+  try {
+    try {
+      engine = await engineFactory(sourceBytes);
+    } catch (err) {
+      throw fail("OPEN_FAILED", err.passwordRequired ? "Source PDF is password-protected" : "Source PDF could not be opened");
+    }
+    const outOfRange = edits.filter((e) => e.pageIndex >= engine.pageCount);
+    if (outOfRange.length) {
+      for (const e of outOfRange) editReport.get(e.id).status = "page-out-of-range";
+      throw fail("PAGE_OUT_OF_RANGE", `Edit page index out of range (document has ${engine.pageCount} pages)`, { ids: outOfRange.map((e) => e.id) });
+    }
+
+    // Phase 1: plan every page against its unchanged snapshot; no commits.
+    const pagePlans = [];
+    const failures = [];
+    for (const [pageIndex, pageEdits] of groupByPage(edits)) {
+      engine.loadPage(pageIndex);
+      engine.normalizeFontsForEdit();
+      const paras = engine.buildModel();
+      const plan = planPageEdits(paras, pageEdits);
+      failures.push(...plan.failures);
+      pagePlans.push({ pageIndex, paras, plan, key: snapshotKey(paras), regenHostile: engine.pageRegenHostile() });
+    }
+    if (failures.length) {
+      for (const f of failures) Object.assign(editReport.get(f.id), { status: "rejected", code: f.code, hits: f.hits });
+      throw fail("MATCH_FAILED", `${failures.length} edit(s) could not be matched exactly once`, { failures });
+    }
+
+    // Phase 2: per page, re-verify the snapshot, capture layout, commit, repair.
+    let mutated = false;
+    for (const { pageIndex, plan, key, regenHostile } of pagePlans) {
+      const pageReport = { pageIndex, paragraphs: [], regenHostile };
+      report.pages.push(pageReport);
+      if (regenHostile) report.warnings.push({ pageIndex, code: "PAGE_REGEN_HOSTILE" });
+      for (const p of plan.plans) {
+        Object.assign(editReport.get(p.edit.id), {
+          status: p.noop ? "noop" : "planned",
+          paragraphIndices: [...p.touched],
+        });
+      }
+      if (plan.perPara.size === 0) continue;
+      engine.loadPage(pageIndex);
+      const paras = engine.buildModel();
+      if (snapshotKey(paras) !== key) throw fail("STATE_DRIFT", "Page model changed between planning and commit", { pageIndex });
+      const context = quality.capturePageLayout(engine, pageIndex, paras);
+      const touched = [];
+      for (const [pi, { del, inserts }] of [...plan.perPara.entries()].sort((x, y) => x[0] - y[0])) {
+        const para = paras[pi];
+        const runs = rebuildRuns(para, del, inserts);
+        mutated = true;
+        const upd = engine.commitParagraph(para.id, runs, para.format);
+        if (!upd) throw fail("COMMIT_FAILED", "Engine rejected a paragraph commit", { pageIndex, paragraphId: para.id });
+        pageReport.paragraphs.push({ index: pi, surgical: !!upd.surgical, sourceLines: para.lines?.length ?? null, committedLines: upd.lines?.length ?? null });
+        touched.push({ id: upd.id ?? para.id, sourceBox: para.box, sourceLines: para.lines, sourceFormat: para.format });
+      }
+      if (reflow) {
+        let r;
+        try {
+          r = quality.repairPageLayout(engine, pageIndex, context, touched);
+        } catch (err) {
+          throw fail("REPAIR_FAILED", "Layout repair raised an error", { pageIndex, cause: err?.code ?? err?.name ?? "Error" });
+        }
+        report.repairs.push({ pageIndex, repairs: r?.repairs ?? [] });
+        const pageWarnings = (r?.warnings ?? []).map((w) => ({ pageIndex, ...(w && typeof w === "object" ? w : { message: String(w) }) }));
+        report.warnings.push(...pageWarnings);
+        // severity:error is a definite repair failure; warning/info are reported only.
+        const errors = pageWarnings.filter((w) => w.severity === "error");
+        if (errors.length) {
+          const unsupported = errors.some((w) => /unsupported/.test(String(w.code)));
+          throw fail(unsupported ? "LAYOUT_UNSUPPORTED" : "REPAIR_FAILED", `Layout repair reported ${errors.length} error(s) on page ${pageIndex}`, {
+            pageIndex,
+            codes: errors.map((w) => w.code),
+          });
+        }
+      }
+      for (const p of plan.plans) if (!p.noop) editReport.get(p.edit.id).status = "applied";
+    }
+
+    if (mutated) {
+      pdf = engine.save();
+      if (!pdf || !pdf.length) throw fail("SAVE_FAILED", "Engine did not produce output bytes");
+      pdf = new Uint8Array(pdf);
+    } else {
+      // Nothing to change: return the source bytes unchanged.
+      pdf = new Uint8Array(sourceBytes);
+    }
+  } finally {
+    try {
+      engine?.close();
+    } catch {}
+    report.engineLog = logCapture.restore();
+  }
+
+  // Same-engine self-check on a freshly reopened copy.
+  const qaCapture = captureConsole(!!options.includeEngineLog);
+  let check;
+  try {
+    check = await quality.inspectSavedPdf(engineFactory, sourceBytes, pdf, edits);
+  } catch (err) {
+    report.selfCheck = { status: "error", error: err?.code ?? err?.name ?? "Error" };
+    throw fail("SELF_CHECK_FAILED", "Saved-PDF self-check could not run");
+  } finally {
+    report.selfCheckLog = qaCapture.restore();
+  }
+  report.selfCheck = { status: check?.ok === true ? "passed" : "failed", ...check };
+  const unapplied = report.edits.filter((r) => r.status !== "applied" && r.status !== "noop");
+  if (unapplied.length) throw fail("EDIT_NOT_APPLIED", "Some requested edits were not applied", { ids: unapplied.map((r) => r.id) });
+  if (check?.ok !== true) throw fail("SELF_CHECK_FAILED", "Saved-PDF self-check reported failures");
+  report.ok = true;
+  report.status = "self-check-passed";
+  return { pdf, report };
+}

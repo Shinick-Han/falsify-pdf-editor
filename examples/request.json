@@ -1,0 +1,12 @@
+{
+  "input": "paper.pdf",
+  "reflow": true,
+  "edits": [
+    {
+      "id": "example",
+      "pageIndex": 0,
+      "before": "If every check passes, continue.",
+      "after": "Continue."
+    }
+  ]
+}
