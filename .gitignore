@@ -1,0 +1,13 @@
+node_modules/
+.runtime/
+output/
+tmp/
+__pycache__/
+*.pdf
+*.doc
+*.docx
+*.key
+*.pem
+.env
+.env.*
+!/.env.example
