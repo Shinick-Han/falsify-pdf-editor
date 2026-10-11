@@ -149,10 +149,31 @@ test("widened edit is resized, restored to its source object slot, followers shi
   assert.deepEqual(now.filter((h) => engine.objs.find((o) => o.h === h).type !== TEXT), nonText);
   assert.equal(r.repairs.find((x) => x.kind === "reading_order").action, "index_only_stream_order_unresolved");
   assert.equal(engine._pageDirty, true);
-  // Object index order is restored, but PDFium serializes the new objects in
-  // an appended stream, so the result must not be reported as clean.
-  const errors = r.warnings.filter((w) => w.severity === "error").map((w) => w.code);
-  assert.deepEqual(errors, ["content_stream_append_order"]);
+  // Object index order is restored in the mock only; the serialized stream
+  // order is unknown here, so the result stays unresolved and carries a
+  // warning that requires the saved text/order check.
+  assert.deepEqual(r.warnings.filter((w) => w.severity === "error"), []);
+  const append = r.warnings.find((w) => w.code === "content_stream_append_order");
+  assert.equal(append.severity, "warning");
+  assert.equal(append.verification, "saved_text_order_required");
+  assert.deepEqual(append.paragraphs, [3]);
+});
+
+test("surgical replacement with new handles is a warning, not a pre-save error", () => {
+  const { engine, model } = makeEngine();
+  const ctx = capturePageLayout(engine, 0, model);
+  // Same-width replacement: new handles, no resize, nothing moved.
+  const p = engine.paras.get(3);
+  const ys = p.handles.map((h) => engine.objectBounds(h));
+  for (const h of p.handles) engine.objs.splice(engine.objs.findIndex((o) => o.h === h), 1);
+  p.handles = [];
+  const next = Math.max(...engine.objs.map((o) => o.h)) + 1;
+  ys.forEach((b, i) => { engine.objs.push({ h: next + i, type: TEXT, b }); p.handles.push(next + i); });
+  const r = repairPageLayout(engine, 0, ctx, touched(model, 3));
+  assert.equal(r.repairs.find((x) => x.id === 3)?.action, "kept_surgical");
+  assert.deepEqual(r.warnings.filter((w) => w.severity === "error"), []);
+  assert.equal(r.warnings.find((w) => w.code === "content_stream_append_order")?.severity, "warning");
+  assert.equal(r.repairs.find((x) => x.kind === "reading_order").action, "index_only_stream_order_unresolved");
 });
 
 test("replaced last paragraph in source order is reported as restored", () => {
@@ -246,6 +267,15 @@ test("inspect rejects reading order changes even with the same words", async () 
   const r = await inspectSavedPdf(factory, src, out, edit);
   assert.equal(r.ok, false);
   assert.ok(r.failures.some((f) => f.code === "edited_page_text_or_order_mismatch"));
+});
+
+test("saved stream that appends the edited paragraph after its followers still fails", async () => {
+  // The pre-save append-order diagnosis is only a warning; the saved check
+  // must still reject an output whose edited text is serialized last.
+  const { factory, src, out } = setup([page([...line("gamma", 50, 576), [" ", 0, 0], ...line("alpha delta", 50, 600)]), page(line("other page", 50, 600))]);
+  const r = await inspectSavedPdf(factory, src, out, edit);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.failures.map((f) => f.code), ["edited_page_text_or_order_mismatch"]);
 });
 
 test("inspect rejects off-page glyphs, moved footer and changed unedited pages", async () => {

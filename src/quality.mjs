@@ -279,8 +279,10 @@ function cascade(engine, ctx, grown, touchedIds, repairs, warnings) {
 // content stream (every object created by a re-layout) into a new stream
 // appended after the existing ones, whatever their object index. The index
 // order fixes draw order inside a stream only, so a replaced paragraph that
-// is followed by surviving source objects is still serialized last. That
-// case is reported as an error instead of being labelled restored.
+// is followed by surviving source objects may still be serialized last. A
+// changed object handle is a risk indicator, not proof of the saved order,
+// so that case is reported as a warning that requires the saved text/order
+// check (inspectSavedPdf) and is never labelled restored.
 export function restoreSourceOrder(engine, ctx, repairs, warnings) {
   const M = engine.M;
   const current = listObjects(engine);
@@ -377,7 +379,12 @@ export function restoreSourceOrder(engine, ctx, repairs, warnings) {
     return ctx.objects.slice(last + 1).some((h) => present.has(h) && !changedIds.has(ownerOfSource.get(h)));
   });
   if (appended.length) {
-    warnings.push({ code: "content_stream_append_order", severity: "error", paragraphs: appended.map((c) => c.id) });
+    warnings.push({
+      code: "content_stream_append_order",
+      severity: "warning",
+      verification: "saved_text_order_required",
+      paragraphs: appended.map((c) => c.id),
+    });
   }
   repairs.push({
     kind: "reading_order",
