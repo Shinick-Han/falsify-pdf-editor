@@ -143,10 +143,21 @@ test("real engine: snapshot reads header TJ text and footer number without mutat
     assert.equal(head.style.font.baseName.includes("Times"), true);
     assert.deepEqual(head.style.fill.slice(0, 3), [51, 77, 153]);
     assert.equal(num.role, "page_number");
-    // The trailing space is a generated char; the anchor uses the digits' ink.
+    // The trailing space is a generated char; the anchor uses the digits'
+    // loose (advance) boxes: each starts at its origin and spans the glyph
+    // advance, independently of the glyph's tight ink.
     assert.equal(num.text, "10");
     assert.equal(num.anchor.anchor, "center");
-    assert.ok(Math.abs(num.anchor.x - (num.chars[0].l + num.chars[1].r) / 2) < 1e-6);
+    const font = M._FPDFTextObj_GetFont(num.h);
+    const p = M._malloc(4);
+    const advance = (u) => (M._FPDFFont_GetGlyphWidth(font, u, num.style.size, p) ? M.HEAPF32[p >> 2] : NaN);
+    for (const c of num.chars) {
+      assert.ok(Math.abs(c.ll - c.ox) < 1e-4, "loose left at origin");
+      assert.ok(Math.abs(c.lr - c.ox - advance(c.u)) < 1e-4, "loose width is the advance");
+    }
+    M._free(p);
+    assert.ok(Math.abs(num.anchor.x - (num.chars[0].ll + num.chars[1].lr) / 2) < 1e-6);
+    assert.ok(num.chars[0].ll < num.chars[0].l && num.chars[1].lr > num.chars[1].r, "advance box differs from tight ink");
     assert.equal(JSON.parse(JSON.stringify(snap)).items[0].h, undefined);
   });
 });
@@ -213,6 +224,9 @@ test("real engine: unsupported edges fail closed with specific codes", { skip },
     [`BT /F2 10 Tf 300 770 Td (3) Tj ET ${rows} ${footer("4")}`, "continuation_page_number_ambiguous"],
     [`${rows} BT /F2 10 Tf 300 30 Td [(1) -400 (0)] TJ ET`, "continuation_page_number_spacing_unsupported"],
     [`${rows} BT /F2 10 Tf 300 30 Td (1) Tj 5 3 Td (0) Tj ET`, "continuation_page_number_ambiguous"],
+    [`${rows} q 0 0 320 36 re W n ${footer("10")} Q`, "continuation_edge_clip_unsupported"],
+    // Page-level clip around all content that cuts into the footer glyphs.
+    [`q 0 33 612 760 re W n ${rows} ${footer("10")} Q`, "continuation_edge_clip_unsupported"],
   ];
   for (const [content, code] of cases) {
     await withPage(pdfFromPages([content]), (engine) => {

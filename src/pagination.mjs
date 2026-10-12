@@ -48,6 +48,7 @@ export const PAGINATION_CAPABILITY = Object.freeze({
     "non_top_level_text",
     "shared_objects",
     "edge_graphics",
+    "edge_clip",
     "edge_text_layout",
     "edge_style",
     "ambiguous_page_number",

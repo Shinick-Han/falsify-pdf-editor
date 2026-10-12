@@ -16,10 +16,14 @@ test("EDITOR_CAPABILITIES advertises reflow and a bounded pagination descriptor"
   assert.equal(EDITOR_CAPABILITIES.reflow, true);
   const p = EDITOR_CAPABILITIES.pagination;
   assert.equal(p.supported, true);
-  assert.match(p.continuationPages, /no copied or synthesized header, footer, page number or label/);
-  assert.ok(p.unsupported.includes("multi_column_flow") && p.unsupported.includes("foreign_object_in_flow"));
+  assert.match(p.continuationPages, /source-style copies of the source page's header\/footer text/);
+  assert.match(p.continuationPages, /standalone Arabic page number becomes source number plus decimal suffix/);
+  assert.match(p.continuationPages, /no synthesized label/);
+  assert.match(p.sourcePageNumbers, /unchanged/);
+  assert.deepEqual({ ...p.continuationStyle }, { version: 1, policy: "source-number-suffix" });
+  for (const u of ["multi_column_flow", "foreign_object_in_flow", "edge_graphics", "edge_clip", "edge_style", "ambiguous_page_number", "page_number_glyph_missing"]) assert.ok(p.unsupported.includes(u), u);
   assert.equal(p.maxNewPagesLimit, PAGINATION_LIMITS.maxNewPages);
-  assert.ok(Object.isFrozen(EDITOR_CAPABILITIES) && Object.isFrozen(p));
+  assert.ok(Object.isFrozen(EDITOR_CAPABILITIES) && Object.isFrozen(p) && Object.isFrozen(p.continuationStyle));
 });
 
 test("planFlow keeps lines that fit (wrap without new page)", () => {

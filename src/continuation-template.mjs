@@ -244,6 +244,13 @@ export function snapshotPageEdges(engine, floor, bodyTop, exclude = null) {
   for (const e of edges) {
     const at = { index: e.index };
     if (M._FPDFPageObj_GetType(e.h) !== OBJ_TEXT) return fail("continuation_edge_graphics_unsupported", at);
+    // A clone cannot be given the source clip path (no public setter), so a
+    // clipped edge would be drawn unclipped. Runtimes without the clip-path
+    // getters cannot detect this; see docs/PAGINATION.md, Known risks.
+    if (typeof M._FPDFPageObj_GetClipPath === "function" && typeof M._FPDFClipPath_CountPaths === "function") {
+      const clip = M._FPDFPageObj_GetClipPath(e.h);
+      if (clip && M._FPDFClipPath_CountPaths(clip) > 0) return fail("continuation_edge_clip_unsupported", at);
+    }
     const cs = chars.get(e.h) || [];
     const text = textOf(cs);
     if (!text.trim()) {

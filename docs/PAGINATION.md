@@ -53,7 +53,8 @@ advances, shifted so its inked extent keeps the source anchor (centre within
 left half). Original edge objects are only read.
 
 Fail-closed codes (severity error, no PDF): `continuation_edge_graphics_unsupported`
-(path/image/shading/form in an edge zone), `continuation_edge_text_layout_unsupported`
+(path/image/shading/form in an edge zone), `continuation_edge_clip_unsupported`
+(edge text with a clip path), `continuation_edge_text_layout_unsupported`
 (chars off one text-space baseline, missing origin/box),
 `continuation_edge_style_unsupported` (blend mode / soft mask),
 `continuation_page_number_unsupported` (roman, `- 4 -`, `3 of 9`, `Page 3`, ...),
@@ -157,9 +158,16 @@ downstream page contents are never modified.
 
 ## Known risks
 
-- Edge clones do not carry the source clip path, marked-content (e.g.
-  `/Artifact`) tags or extended graphics state beyond colour alpha; a source
-  header clipped by a page-level clip is copied unclipped.
+- Edge clones cannot carry a source clip path, so an edge text object with
+  any clip path (FPDFClipPath_CountPaths > 0, including a page-level clip
+  around all content that cuts into it) is refused with
+  `continuation_edge_clip_unsupported`. A runtime that does not export
+  FPDFPageObj_GetClipPath/FPDFClipPath_CountPaths cannot detect clipping
+  and copies such edges unclipped. Text-render-mode clipping (Tr 4-7) is not
+  inspected separately. Observed on the candidate runtime: a rectangular
+  clip that fully contains the edge object is not reported for it (no
+  visible effect), so it is not refused. Clones also do not carry marked-content (e.g.
+  `/Artifact`) tags or extended graphics state beyond colour alpha.
 - Glyph availability for the suffix is a width + outline check through the
   font's Unicode mapping; a subset font whose `.notdef`-like outline is
   reached by that mapping is not distinguished from a real glyph.
