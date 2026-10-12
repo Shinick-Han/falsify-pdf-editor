@@ -8,13 +8,16 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { EditError } from "../src/editor.mjs";
+import { EDITOR_CAPABILITIES, EditError } from "../src/editor.mjs";
 import { CANDIDATE_ENV } from "../src/runtime.mjs";
 import { BRIDGE_LIMITS, REQUEST_SCHEMA, capabilities, editorCapabilities, main, parseArgs, sanitizeReport } from "../src/web-bridge.mjs";
 
 const sha = (b) => createHash("sha256").update(b).digest("hex");
 const ENV = { [CANDIDATE_ENV]: join(tmpdir(), "candidate-manifest.json") };
 const BYTES = Buffer.from("synthetic source bytes, not a PDF");
+// The actual editor module exports a pagination descriptor with
+// .supported === true; mocks without EDITOR_CAPABILITIES keep the fallback.
+const ACTUAL_CAPS = { reflow: true, pagination: true };
 
 function workspace(edit = (r) => r) {
   const dir = mkdtempSync(join(tmpdir(), "fpe-bridge-"));
@@ -61,6 +64,12 @@ test("editor capabilities default to reflow true, pagination false until exporte
   assert.deepEqual(editorCapabilities({ EDITOR_CAPABILITIES: { pagination: { supported: true, maxPages: 2 } } }), { reflow: true, pagination: true });
   assert.deepEqual(editorCapabilities({ EDITOR_CAPABILITIES: { pagination: { supported: "true" }, reflow: { supported: false } } }), { reflow: false, pagination: false });
   assert.deepEqual(editorCapabilities({ EDITOR_CAPABILITIES: { pagination: { enabled: true } } }), { reflow: true, pagination: false });
+});
+
+test("actual editor module exports a supported pagination descriptor", () => {
+  assert.equal(EDITOR_CAPABILITIES.reflow, true);
+  assert.equal(EDITOR_CAPABILITIES.pagination?.supported, true);
+  assert.deepEqual(editorCapabilities(), ACTUAL_CAPS);
 });
 
 test("sanitizeReport keeps codes and digests, drops text, logs and paths", () => {
@@ -116,7 +125,7 @@ test("successful edit writes output and sanitized report", async () => {
     assert.deepEqual([...readFileSync(join(ws.dir, "output.bin"))], [1, 2, 3]);
     const report = JSON.parse(readFileSync(join(ws.dir, "report.json"), "utf8"));
     assert.equal(report.outputSha256, sha(Buffer.from([1, 2, 3])));
-    assert.deepEqual(report.capabilities, { reflow: true, pagination: false });
+    assert.deepEqual(report.capabilities, ACTUAL_CAPS);
     assert.deepEqual(readFileSync(join(ws.dir, "input.bin")), BYTES, "source untouched");
   } finally {
     ws.cleanup();
@@ -228,7 +237,8 @@ test("capabilities with an injected runtime are sanitized", async () => {
   assert.ok(closed);
   assert.equal(caps.engine, "falsify-pdf-editor");
   assert.equal(caps.wasmSha256, "1".repeat(64));
-  assert.equal(caps.pagination, false);
+  assert.equal(caps.reflow, true);
+  assert.equal(caps.pagination, true);
   assert.ok(!JSON.stringify(caps).includes("private"));
 });
 
@@ -240,6 +250,6 @@ test("capabilities load the real patched candidate manifest", { skip: !manifest 
   assert.match(caps.wasmSha256, /^[0-9a-f]{64}$/);
   if (process.env.FALSIFY_EXPECT_WASM_SHA256) assert.equal(caps.wasmSha256, process.env.FALSIFY_EXPECT_WASM_SHA256);
   assert.equal(caps.reflow, true);
-  assert.equal(caps.pagination, false);
+  assert.equal(caps.pagination, true);
   assert.ok(!JSON.stringify(caps).includes(":\\") && !JSON.stringify(caps).includes("manifestPath"));
 });
