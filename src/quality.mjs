@@ -239,7 +239,16 @@ export function repairPageLayout(engine, pageIndex, context, touched, options = 
   const p = paginate(engine, context, grown, { floor: overflow.floor });
   repairs.push(...(p?.repairs ?? []));
   warnings.push(...(p?.warnings ?? []));
-  return { repairs, warnings, pagination: p?.ok ? { added: p.added, lineCounts: p.lineCounts, keptLines: p.keptLines, bodyTop: p.bodyTop, floor: p.floor } : null };
+  if (!p?.ok) return { repairs, warnings, pagination: null };
+  const pagination = { added: p.added, lineCounts: p.lineCounts, keptLines: p.keptLines, bodyTop: p.bodyTop, floor: p.floor };
+  if (p.continuationStyle !== undefined) {
+    if (!validContinuationStyle(p.continuationStyle)) {
+      warnings.push({ code: "continuation_style_invalid", pageIndex, severity: "error" });
+      return { repairs, warnings, pagination: null };
+    }
+    pagination.continuationStyle = { ...p.continuationStyle };
+  }
+  return { repairs, warnings, pagination };
 }
 
 // Shift following body paragraphs of the same column by the growth above
@@ -420,12 +429,46 @@ function claimedText(M, h) {
 
 // ---------- saved-PDF self-check ----------
 
+// Per-glyph style read from the text page: font name and flags, size, fill
+// and stroke colour, render mode and the scale/rotation part of the glyph
+// matrix, plus origin, loose (advance-width) box and owning text object.
+// Absent when the runtime does not export the text-page style API; such a
+// page cannot verify copied edge content.
+const STYLE_FNS = ["_FPDFText_GetFontSize", "_FPDFText_GetFontInfo", "_FPDFText_GetFillColor", "_FPDFText_GetStrokeColor", "_FPDFText_GetMatrix", "_FPDFText_GetCharOrigin", "_FPDFText_GetLooseCharBox", "_FPDFText_GetTextObject", "_FPDFTextObj_GetTextRenderMode"];
+
+function readStyle(M, tp, i, buf) {
+  const n = M._FPDFText_GetFontInfo(tp, i, buf, 128, buf + 128);
+  const font = n > 0 && n <= 128 ? M.UTF8ToString(buf, 128) : null;
+  const flags = M.HEAP32[(buf + 128) >> 2];
+  const rgba = (fn, at) => (M[fn](tp, i, at, at + 4, at + 8, at + 12) ? [0, 1, 2, 3].map((k) => M.HEAPU32[(at >> 2) + k]) : null);
+  const fill = rgba("_FPDFText_GetFillColor", buf + 144);
+  const stroke = rgba("_FPDFText_GetStrokeColor", buf + 160);
+  const f32 = (at, k) => M.HEAPF32[(at >> 2) + k];
+  const mat = M._FPDFText_GetMatrix(tp, i, buf + 176) ? [0, 1, 2, 3].map((k) => f32(buf + 176, k)) : null;
+  const origin = M._FPDFText_GetCharOrigin(tp, i, buf + 208, buf + 216) ? [M.HEAPF64[(buf + 208) >> 3], M.HEAPF64[(buf + 216) >> 3]] : null;
+  const loose = M._FPDFText_GetLooseCharBox(tp, i, buf + 224) ? [f32(buf + 224, 0), f32(buf + 224, 2)] : null;
+  const obj = M._FPDFText_GetTextObject(tp, i) >>> 0;
+  const render = obj ? M._FPDFTextObj_GetTextRenderMode(obj) : null;
+  return { obj, origin, loose, style: { font, flags, size: M._FPDFText_GetFontSize(tp, i), fill, stroke, render, mat } };
+}
+
+function sameStyle(a, b) {
+  if (!a || !b) return a === b;
+  const eq = (x, y, tol = 0) => (x === null || y === null ? x === y : x.every((v, k) => Math.abs(v - y[k]) <= tol));
+  return a.font !== null && a.font === b.font && a.flags === b.flags && Math.abs(a.size - b.size) <= 0.01 && a.render === b.render
+    && eq(a.fill, b.fill) && eq(a.stroke, b.stroke) && eq(a.mat, b.mat, 1e-3);
+}
+
+const sameStyles = (a, b) => a.length === b.length && a.every((c, k) => sameStyle(c.style ?? null, b[k].style ?? null));
+
 function readGlyphs(engine, pageIndex) {
   ensurePage(engine, pageIndex);
   const M = engine.M;
   const tp = M._FPDFText_LoadPage(engine.page);
   const n = tp ? M._FPDFText_CountChars(tp) : 0;
+  const styled = STYLE_FNS.every((f) => typeof M[f] === "function") && typeof M.UTF8ToString === "function";
   const b = M._malloc(32);
+  const sb = styled ? M._malloc(256) : 0;
   let text = "";
   const glyphs = [];
   const chars = [];
@@ -438,12 +481,13 @@ function readGlyphs(engine, pageIndex) {
     }
     const l = M.HEAPF64[b >> 3], r = M.HEAPF64[(b + 8) >> 3];
     const bo = M.HEAPF64[(b + 16) >> 3], t = M.HEAPF64[(b + 24) >> 3];
-    glyphs.push({ u, l, r, b: bo, t, i });
+    glyphs.push(styled ? { u, l, r, b: bo, t, i, ...readStyle(M, tp, i, sb) } : { u, l, r, b: bo, t, i });
     chars.push({ u, cy: (bo + t) / 2 });
   }
   M._free(b);
+  if (sb) M._free(sb);
   if (tp) M._FPDFText_ClosePage(tp);
-  return { text, glyphs, chars, W: M._FPDF_GetPageWidthF(engine.page), H: M._FPDF_GetPageHeightF(engine.page) };
+  return { text, glyphs, chars, styled, W: M._FPDF_GetPageWidthF(engine.page), H: M._FPDF_GetPageHeightF(engine.page) };
 }
 
 function offPage(g) {
@@ -581,7 +625,7 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
       row.extents = { source: se, output: oe };
       if (se && oe && (oe.right > se.right + TOL || oe.left < se.left - TOL)) failures.push({ code: "text_outside_source_columns", pageIndex: i });
       const es = edgeGlyphs(s), eo = edgeGlyphs(o);
-      const stable = sameGlyphs(es, eo);
+      const stable = sameGlyphs(es, eo) && sameStyles(es, eo);
       row.edge_glyphs = es.length;
       row.edge_stable = stable;
       if (!stable) {
@@ -634,9 +678,19 @@ export function normalizePageMap(map, sourcePageCount) {
     }
     if (cont.length && !(Number.isFinite(m.bodyTop) && Number.isFinite(m.floor) && m.bodyTop > m.floor)) return null;
     if (cont.length && !(Array.isArray(m.lineCounts) && m.lineCounts.length === cont.length)) return null;
+    if (m.continuationStyle !== undefined && !(cont.length && validContinuationStyle(m.continuationStyle))) return null;
     out.push({ ...m, continuationPageIndices: [...cont] });
   }
   return out;
+}
+
+// The only continuation style: source running header/footer objects are
+// copied unchanged and a standalone Arabic source page number gets a decimal
+// suffix ("10" -> "10.1"). Exact shape, no extra keys.
+export function validContinuationStyle(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v)
+    && Object.keys(v).sort().join() === "applied,policy,version"
+    && v.version === 1 && v.policy === "source-number-suffix" && v.applied === true;
 }
 
 // Text of the body band only: whitespace and line breaks are kept, glyphs
@@ -653,6 +707,106 @@ function outsideBand(g, floor, bodyTop) {
     const cy = (c.b + c.t) / 2;
     return cy < floor || cy > bodyTop;
   });
+}
+
+function inBand(g, floor, bodyTop) {
+  return g.glyphs.filter((c) => {
+    const cy = (c.b + c.t) / 2;
+    return cy >= floor && cy <= bodyTop;
+  });
+}
+
+function byObject(glyphs) {
+  const m = new Map();
+  for (const c of glyphs) m.set(c.obj, [...(m.get(c.obj) || []), c]);
+  return [...m.values()].map((cs) => cs.sort((a, b) => a.i - b.i));
+}
+
+const textOf = (cs) => String.fromCharCode(...cs.map((c) => c.u));
+
+// Source page numbers: edge text objects whose visible glyphs are only
+// Arabic digits. Two such objects with different values are ambiguous.
+function sourcePageNumbers(es) {
+  const items = byObject(es).filter((cs) => /^\d+$/.test(textOf(cs))).map((cs) => ({ glyphs: cs, text: textOf(cs) }));
+  return { items, ambiguous: new Set(items.map((x) => x.text)).size > 1 };
+}
+
+// Alignment of a number from its advance-width extent on the page.
+function numberAnchor(L, R, W) {
+  const c = (L + R) / 2;
+  return Math.abs(c - W / 2) <= 2 ? "center" : c > W / 2 ? "right" : "left";
+}
+
+const samePlace = (c, d) => c.u === d.u && Math.abs(c.l - d.l) <= 0.5 && Math.abs(c.r - d.r) <= 0.5 && Math.abs(c.b - d.b) <= 0.5 && Math.abs(c.t - d.t) <= 0.5;
+
+// Expected edge content of continuation page `ordinal` (1-based) is derived
+// from the SOURCE page only, never from the editor report: every source
+// edge glyph at its source position and style, except each source page
+// number, which must read "<source number>.<ordinal>" as one text object in
+// the number's style and baseline, digits at their source spacing, suffix
+// at natural advance, aligned on the number's source left, centre or right
+// (by page position). Anything else outside the body band is extra.
+function checkContinuationEdges(s, es, g, edge, ordinal, pageIndex, outputPageIndex, failures) {
+  const fail = (code, extra = {}) => failures.push({ code, pageIndex, outputPageIndex, ...extra });
+  const res = { expected_glyphs: 0, output_glyphs: edge.length, page_numbers: [] };
+  if (!s.styled || !g.styled) {
+    fail("continuation_edge_style_unverifiable");
+    return res;
+  }
+  const numbers = sourcePageNumbers(es);
+  if (numbers.ambiguous) {
+    fail("continuation_page_number_ambiguous");
+    return res;
+  }
+  const numbered = new Set(numbers.items.flatMap((x) => x.glyphs));
+  const fixed = es.filter((c) => !numbered.has(c));
+  res.expected_glyphs = fixed.length + numbers.items.reduce((n, x) => n + x.text.length + 1 + String(ordinal).length, 0);
+  const left = [...edge];
+  let missing = 0, styled = 0;
+  for (const c of fixed) {
+    const k = left.findIndex((d) => samePlace(c, d));
+    if (k < 0) {
+      missing++;
+      continue;
+    }
+    if (!sameStyle(c.style, left[k].style)) styled++;
+    left.splice(k, 1);
+  }
+  if (missing) fail("continuation_edge_missing", { count: missing });
+  if (styled) fail("continuation_edge_style_mismatch", { count: styled });
+  const groups = byObject(left);
+  for (const x of numbers.items) {
+    const sd = [...x.glyphs].sort((a, b) => a.l - b.l), ref = sd[0];
+    const want = x.text + "." + ordinal;
+    const k = groups.findIndex((cs) => cs[0].origin && ref.origin && Math.abs(cs[0].origin[1] - ref.origin[1]) <= 0.5);
+    const rest = k < 0 ? [] : groups.splice(k, 1)[0];
+    const pn = { source: x.text, expected: want, output: textOf(rest), anchor: null };
+    res.page_numbers.push(pn);
+    if (pn.output !== want) {
+      fail("continuation_page_number_mismatch", { source: x.text });
+      continue;
+    }
+    const off = rest.filter((c) => !sameStyle(ref.style, c.style)).length;
+    if (off) fail("continuation_edge_style_mismatch", { count: off });
+    const n = sd.length;
+    let placed = rest.every((c, j) => c.origin && c.loose && Math.abs(c.origin[1] - ref.origin[1]) <= 0.5 && (j === 0 || Math.abs(c.loose[0] - rest[j - 1].loose[1]) <= 0.5 || j < n));
+    for (let j = 0; placed && j < n; j++) {
+      const c = rest[j], d = sd[j];
+      if (c.u !== d.u || Math.abs(c.l - rest[0].l - (d.l - ref.l)) > 0.5 || Math.abs(c.r - c.l - (d.r - d.l)) > 0.5 || Math.abs(c.b - d.b) > 0.5 || Math.abs(c.t - d.t) > 0.5) placed = false;
+    }
+    if (placed && ref.loose && sd[n - 1].loose) {
+      const L = ref.loose[0], R = sd[n - 1].loose[1], L2 = rest[0].loose[0], R2 = rest[rest.length - 1].loose[1];
+      pn.anchor = numberAnchor(L, R, s.W);
+      const err = pn.anchor === "left" ? L2 - L : pn.anchor === "right" ? R2 - R : (L2 + R2 - L - R) / 2;
+      if (Math.abs(err) > 0.5) placed = false;
+    } else {
+      placed = false;
+    }
+    if (!placed) fail("continuation_page_number_moved", { source: x.text });
+  }
+  const extra = groups.reduce((n, cs) => n + cs.length, 0);
+  if (extra) fail("continuation_edge_extra", { count: extra });
+  return res;
 }
 
 // Measured text lines: glyphs grouped by vertical-centre membership.
@@ -700,7 +854,9 @@ function inspectContinued(s, o, out, m, pageEdits, row, failures, warnings, incl
   const lo = floor - 0.5, hi = bodyTop + 0.5;
   const exp = expectedPageText(bandText(s, lo, hi), pageEdits);
   const conts = m.continuationPageIndices.map((k) => readGlyphs(out, k));
-  const parts = [bandText(o, lo, hi), ...conts.map((g) => g.text)].map(normStr);
+  // Every page of the flow is compared by its body band only; anything a
+  // continuation page carries outside the band is checked as edge content.
+  const parts = [o, ...conts].map((g) => normStr(bandText(g, lo, hi)));
   const joined = joinFlowParts(parts, exp.ok ? exp.text : "");
   const got = joined.text;
   row.body_band = { floor: +floor.toFixed(2), bodyTop: +bodyTop.toFixed(2) };
@@ -716,23 +872,32 @@ function inspectContinued(s, o, out, m, pageEdits, row, failures, warnings, incl
   if (parts.slice(1).some((p) => !p)) failures.push({ code: "continuation_page_empty", pageIndex: i });
   const es = outsideBand(s, lo, hi), eo = outsideBand(o, lo, hi);
   row.edge_glyphs = es.length;
-  row.edge_stable = sameGlyphs(es, eo);
+  row.edge_stable = sameGlyphs(es, eo) && sameStyles(es, eo);
   if (!row.edge_stable) failures.push({ code: "header_footer_moved", pageIndex: i });
   const se = extents(s);
   row.continuation = conts.map((g, k) => {
+    const bodyGlyphs = inBand(g, lo, hi);
+    const edge = outsideBand(g, lo, hi);
     const c = {
       outputPageIndex: m.continuationPageIndices[k],
-      lines: { planned: m.lineCounts[k], measured: countGlyphLines(g.glyphs) },
+      lines: { planned: m.lineCounts[k], measured: countGlyphLines(bodyGlyphs) },
       offpage: offPage(g),
       overlap: overlaps(g, true),
-      outside_band: outsideBand(g, lo, hi).length,
-      extents: extents(g),
+      outside_band: edge.length,
+      // Column check on the body only: edge content is verified against the
+      // source page position by position, and a page-number suffix may
+      // legitimately extend past the source text extent.
+      extents: extents({ glyphs: bodyGlyphs }),
       size: { W: g.W, H: g.H },
     };
     if (c.lines.planned !== c.lines.measured) failures.push({ code: "continuation_line_count_mismatch", pageIndex: i, outputPageIndex: c.outputPageIndex });
     if (c.offpage) failures.push({ code: "glyphs_off_page", pageIndex: i, outputPageIndex: c.outputPageIndex, count: c.offpage });
     if (c.overlap > overlaps(s, true)) failures.push({ code: "glyph_overlap_increased", pageIndex: i, outputPageIndex: c.outputPageIndex });
-    if (c.outside_band) failures.push({ code: "continuation_outside_body_band", pageIndex: i, outputPageIndex: c.outputPageIndex });
+    if (m.continuationStyle) {
+      c.edges = checkContinuationEdges(s, es, g, edge, k + 1, i, c.outputPageIndex, failures);
+    } else if (c.outside_band) {
+      failures.push({ code: "continuation_outside_body_band", pageIndex: i, outputPageIndex: c.outputPageIndex });
+    }
     if (se && c.extents && (c.extents.right > se.right + TOL || c.extents.left < se.left - TOL)) failures.push({ code: "text_outside_source_columns", pageIndex: i, outputPageIndex: c.outputPageIndex });
     if (Math.abs(g.W - s.W) > 0.01 || Math.abs(g.H - s.H) > 0.01) failures.push({ code: "continuation_page_size_mismatch", pageIndex: i, outputPageIndex: c.outputPageIndex });
     return c;

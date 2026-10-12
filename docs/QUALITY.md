@@ -71,6 +71,40 @@ The default runtime still has the eight stream-order failures; this fix is
 used only when the rebuilt candidate is explicitly selected. These are
 controlled document checks, not BLUE/RED model or scientific-validity scores.
 
+## Continuation pages with copied edges (self-check)
+
+`inspectSavedPdf` checks a continued source page against the SOURCE PDF and
+the page map's body band `[floor - 0.5, bodyTop + 0.5]` only. The editor
+report never supplies expected edge text.
+
+- The ordered flow (output page, then every continuation page) is compared
+  by body-band text only; planned line counts are compared with lines
+  measured from body-band glyphs only.
+- Original output page edges must keep every source edge glyph at its source
+  position and, where the runtime exposes it, its style (font name and
+  flags, size, fill/stroke colour, render mode, glyph matrix scale/rotation).
+- A map entry may carry exactly
+  `continuationStyle: { version: 1, policy: "source-number-suffix", applied: true }`,
+  only on an entry with continuation pages; any other shape invalidates the
+  map. Without it (old body-only maps), any glyph outside the band on a
+  continuation page fails as `continuation_outside_body_band`.
+- With it, continuation page `k` (1-based) must carry every non-number source
+  edge glyph at its source position and style. Each source edge text object
+  that is only Arabic digits must appear as one object reading
+  `<number>.<k>` on the source baseline and style, digits at their source
+  spacing, suffix at natural advance, aligned on the source left, centre or
+  right by page position (centre within 2pt of mid-page). Missing, extra,
+  moved or restyled edge glyphs, changed numbering, two different source
+  numbers, body text moved outside the band, and runtimes without the
+  text-page style API all fail. Body column, overlap and off-page checks
+  stay as before (column extents measured on body glyphs).
+
+This remains a same-PDFium self-check. A private probe on hand-built PDFs
+with the patched candidate runtime accepted the correct copy and rejected
+changed/unsuffixed number, wrong anchor, size, colour, render mode, moved,
+missing and extra header text and body text hidden in the footer zone. It
+has not yet been run on engine-produced continuation pages.
+
 ## Remaining implementation boundaries
 
 1. Implement pagination before claiming arbitrary long expansions are safe.
