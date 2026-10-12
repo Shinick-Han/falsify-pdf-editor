@@ -103,17 +103,29 @@ This remains a same-PDFium self-check. A private probe on hand-built PDFs
 with the patched candidate runtime accepted the correct copy and rejected
 changed/unsuffixed number, wrong anchor, size, colour, render mode, moved,
 missing and extra header text and body text hidden in the footer zone. It
-has not yet been run on engine-produced continuation pages.
+has now also been run on engine-produced continuation pages: 34 real saved-PDF
+control/tamper cases passed their expected gates. Independent corpus checks used
+three text extractors and two renderers; these private fixtures are not published
+as a scientific benchmark or a proof for arbitrary inputs.
+
+The self-check is not a visual integrity verifier. Diagnostic probes showed that
+invisible/white body text, non-text covers, visually swapped body lines and
+position/style changes on unedited downstream pages can retain the text/geometry
+properties currently checked. These are documented gaps, not passing negative
+tests. Independent rendering and human review remain necessary; the fixed editor
+path is not a validator for arbitrary third-party modified PDFs.
 
 ## Remaining implementation boundaries
 
-1. Implement pagination before claiming arbitrary long expansions are safe.
+1. Pagination is bounded to the supported single-column text flow; do not claim
+   arbitrary long expansions or full-template replication are safe.
 2. Existing cross-stream z-order is not solved by new-object binding. Tagged
    MCID spans and ambient operations not owned by page objects are not
    universally preserved; pure tail appends retain the non-regeneration path.
 3. Add missing-glyph, mixed-font, column, table, equation, rotation/crop, and
    scanned-document cases. They are currently unverified or unsupported.
 
-Neither a website integration, broker restart, binary publication nor a
-production rollout has been performed. Source patches, build recipes and
-candidate-runtime verification remain distinct from deploying an editor.
+The Workbench bridge now supports explicit local-editor configuration. Existing
+running companions are not silently restarted or upgraded, and the source release
+does not bundle patched WASM binaries. Source patches, build recipes and runtime
+verification remain distinct from recipient setup or a production certification.

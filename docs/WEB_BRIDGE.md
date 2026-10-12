@@ -1,4 +1,4 @@
-# Local Workbench bridge (alpha.3)
+# Local Workbench bridge (alpha.4)
 
 `src/web-bridge.mjs` is a fixed JSON bridge, not a shell or agent executor.
 It requires an explicitly configured, digest-verified patched candidate manifest
@@ -29,6 +29,16 @@ timeouts and budgets. Configured failures never fall back to the old editor. The
 UI requires `layoutVerified === true` and matching output bytes/hash. Same-engine
 self-check is not independent rendering QA, scientific validity or RED/BLUE
 performance evidence.
+
+Alpha.4 adds the optional `continuationStyle` capability, only for the known
+`source-number-suffix` policy. This covers source-font text headers/footers and
+standalone Arabic page numbers; original numbers remain unchanged and new pages
+use a decimal continuation suffix (for example `10.1`). Graphics, ambiguous
+numbering and unsupported text layout remain explicit failures. The output
+report exposes only `{policy, applied: true, copiedPages}` after a passed
+self-check, with a positive count equal to the reported added-page count and
+at most 32. Source edge text, font handles and private paths are never published
+in this metadata. A missing capability keeps old companions compatible.
 
 Alpha.3 integration checks: 80 module tests executed, zero failures/skips in the
 prepared coordinator environment; actual browser upload/edit/export produced

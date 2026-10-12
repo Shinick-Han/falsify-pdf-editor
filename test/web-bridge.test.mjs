@@ -17,7 +17,9 @@ const ENV = { [CANDIDATE_ENV]: join(tmpdir(), "candidate-manifest.json") };
 const BYTES = Buffer.from("synthetic source bytes, not a PDF");
 // The actual editor module exports a pagination descriptor with
 // .supported === true; mocks without EDITOR_CAPABILITIES keep the fallback.
-const ACTUAL_CAPS = { reflow: true, pagination: true };
+const ACTUAL_CAPS = { reflow: true, pagination: true,
+  continuationStyle: {supported: true, policy: "source-number-suffix", scope: "text-only source-style header/footer; standalone Arabic source number plus decimal suffix; originals unchanged"},
+};
 
 function workspace(edit = (r) => r) {
   const dir = mkdtempSync(join(tmpdir(), "fpe-bridge-"));
@@ -84,6 +86,22 @@ test("sanitizeReport keeps codes and digests, drops text, logs and paths", () =>
   assert.equal(r.layoutVerified, true);
   assert.equal(r.selfCheck.independent, false);
   assert.deepEqual(r.repairs, [{ pageIndex: 0, count: 1 }]);
+});
+
+test("continuation style exposes only known capability and verified bounded counts", () => {
+  const style = {supported: true, policy: "source-number-suffix", scope: "secret file text", path: "C:/private"};
+  assert.deepEqual(editorCapabilities({EDITOR_CAPABILITIES:{pagination:true,continuationStyle:style}}), ACTUAL_CAPS);
+  for (const bad of [{...style,supported:"true"},{...style,policy:"unknown"},null]) {
+    assert.equal(editorCapabilities({EDITOR_CAPABILITIES:{continuationStyle:bad}}).continuationStyle, undefined);
+  }
+  const report = {...passing,pagination:{addedPages:2,continuationStyle:{policy:"source-number-suffix",applied:true,copiedPages:2,text:"secret",path:"C:/private"}}};
+  assert.deepEqual(sanitizeReport(report).continuationStyle,{policy:"source-number-suffix",applied:true,copiedPages:2});
+  assert.ok(!JSON.stringify(sanitizeReport(report)).includes("secret"));
+  for(const changes of [{copiedPages:0},{copiedPages:33},{copiedPages:1},{copiedPages:"2"},{applied:"true"},{policy:"unknown"}]) {
+    assert.equal(sanitizeReport({...report,pagination:{...report.pagination,continuationStyle:{...report.pagination.continuationStyle,...changes}}}).continuationStyle,undefined);
+  }
+  assert.equal(sanitizeReport({...report,ok:false}).continuationStyle,undefined);
+  assert.equal(sanitizeReport(passing).continuationStyle,undefined);
 });
 
 test("layoutVerified, wrappedLines and sourcePageMap follow the editor report only", () => {

@@ -53,7 +53,16 @@ function packageInfo() {
 const flag = (v, fallback) => (typeof v === "boolean" ? v : v && typeof v === "object" ? v.supported === true : fallback);
 export function editorCapabilities(mod = editor) {
   const caps = mod?.EDITOR_CAPABILITIES;
-  return { reflow: flag(caps?.reflow, true), pagination: flag(caps?.pagination, false) };
+  const style = caps?.continuationStyle;
+  return {
+    reflow: flag(caps?.reflow, true), pagination: flag(caps?.pagination, false),
+    ...(style?.supported === true && style.policy === "source-number-suffix" ? {
+      continuationStyle: {
+        supported: true, policy: "source-number-suffix",
+        scope: "text-only source-style header/footer; standalone Arabic source number plus decimal suffix; originals unchanged",
+      },
+    } : {}),
+  };
 }
 
 export function sanitizeRuntime(info) {
@@ -279,6 +288,14 @@ export function sanitizeReport(report, extra = {}) {
     pageCount: pc ? { source: int(pc.source), output: int(pc.output) } : null,
     addedPages: count(r.pagination?.addedPages),
     sourcePageMap: sourcePageMap(r),
+    ...(layoutVerified && r.pagination?.continuationStyle?.applied === true &&
+      r.pagination.continuationStyle.policy === "source-number-suffix" &&
+      count(r.pagination.continuationStyle.copiedPages) !== null &&
+      r.pagination.continuationStyle.copiedPages > 0 &&
+      r.pagination.continuationStyle.copiedPages <= 32 &&
+      r.pagination.continuationStyle.copiedPages === r.pagination.addedPages ? {
+        continuationStyle: {policy: "source-number-suffix", applied: true, copiedPages: r.pagination.continuationStyle.copiedPages},
+      } : {}),
     independentQA: { status: "pending", note: "Same-engine self-check only; independent QA is still required." },
     ...extra,
   };
