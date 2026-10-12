@@ -1,7 +1,9 @@
 # Content-stream order repair (PDFium patch)
 
-Status: source patch for a rebuilt WASM. It is **not** in the supplied
-upstream binary and has not been accepted on a rebuilt engine yet.
+Status: compiled into a local WASM and accepted for the tested corpus (see
+[`QUALITY.md`](QUALITY.md)). It is **not** in the default supplied upstream
+binary. No existing Workbench integration or general-purpose PDF certification
+is implied.
 
 ## Root cause
 
@@ -67,9 +69,10 @@ compiles it against stand-in types (host `g++` or WSL `g++`; skipped
 otherwise). It covers middle/front/tail insertion, inactive objects, pages
 with no streamed or no existing objects, multi-stream pages, stale indices,
 and asserts that non-monotonic existing objects are never rebound. It does
-not exercise serialization, CTM or graphics state; those, the synthetic
-2-page SHORT/LONG cases, the graphics single/multi-stream fixtures and the
-private 18-page corpus require the rebuilt WASM.
+not themselves exercise serialization, CTM or graphics state. Separate real
+rebuilt-WASM checks covered synthetic SHORT/LONG, graphics single/multi-stream,
+cross-stream translated/scaled CTM with a Form graphic, and the private
+18-page corpus, using independent extraction and rendering.
 
 Apply order: PDFium `fce2b000cc7a9e2cabc92db41cd57ca03233f07d`, then engine
 `security-fixes.patch`, `editcore-pdfium.patch`, then this patch

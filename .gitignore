@@ -2,6 +2,9 @@ node_modules/
 .runtime/
 .runtime-staging-*/
 .runtime-backup-*/
+.runtime-candidate/
+.runtime-candidate-staging-*/
+.runtime-candidate-backup-*/
 output/
 tmp/
 __pycache__/

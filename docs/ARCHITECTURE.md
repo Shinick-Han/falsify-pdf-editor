@@ -91,10 +91,12 @@ relicense other projects' code by copying it into this module.
 
 ## Binary provenance
 
-The engine binaries are upstream committed artifacts verified by SHA-256
-against the pinned Git blobs. They have not been rebuilt independently.
-[`BUILD.md`](BUILD.md) separates what the hash check proves from what a source
-rebuild would add.
+The default engine binaries are upstream committed artifacts verified by
+SHA-256 against pinned Git blobs. A single independent local source rebuild
+reproduced both artifacts exactly; a patched rebuild has a different WASM
+digest and is available through explicit candidate selection. [`BUILD.md`](BUILD.md)
+and [`CANDIDATE_RUNTIME.md`](CANDIDATE_RUNTIME.md) separate byte verification,
+observed build provenance, and caller-supplied manifest expectations.
 
 ## Limitations
 

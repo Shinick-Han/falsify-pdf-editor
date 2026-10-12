@@ -1,13 +1,14 @@
-# Tested scope of the first alpha
+# Tested scope (alpha.2)
 
 This is an implementation baseline and reproducible research module, not a
 general PDF editor or a promise that all short edits work.
 
-## Coordinator checks
+## Default baseline checks
 
-- Automated suite: **42 passed, 0 failed, 0 skipped** after preparing the
-  pinned runtime. Includes real-WASM smoke tests and synthetic mocks; the
-  count is not 42 independent document-quality tests.
+- Current automated suite: **53 passed, 0 failed, 0 skipped** after preparing
+  the pinned runtime. Includes real-WASM smoke tests, synthetic mocks,
+  candidate identity/concurrency checks, import-failure recovery and C++
+  binding tests; the count is not 53 independent document-quality tests.
 - Local 18-page corpus: three unique text-shortening replacements, including
   one crossing two source lines, passed individually and together. MuPDF,
   PDFium, and pypdf each produced the exact expected normalized whole-document
@@ -40,15 +41,45 @@ comparison. Definite move/insertion failures and pagination errors remain
 errors. The final text comparison is not weakened to a word bag or an After
 substring check.
 
-## Next implementation boundary
+## Actual source build and patched-runtime acceptance
 
-1. Fix or expose source content-stream assignment in the PDFium/editcore layer,
-   then rebuild and check against the pinned dependency/toolchain manifest.
-2. Test the actual saved stream order with all three independent extractors.
-3. Preserve original line pitch, column width, headers/footers, and graphical
-   stacking. Implement pagination before claiming long expansions are safe.
-4. Add missing-glyph, mixed-font, column, table, equation, rotation/crop, and
+One independent local build from pinned C++ reproduced the upstream JS/WASM
+byte-for-byte. A second build applied `pdfium-stream-order.patch`, rebuilt the
+content generator/static archive, and relinked the WASM. Its SHA-256 is
+`12e43c4c2e7deedab629c3b08b14fc0b24c1336f92b7de30ac58d7ec6dcbb833`.
+This establishes the recorded local build, not universal reproducibility.
+
+| Corpus case | Default / rebuilt unpatched baseline | Patched build |
+|---|---|---|
+| 18-page corpus: no-op, three short replacements individually, combined | 5 passed | 5 passed |
+| Original 2-page standard-font fixture: short and long replacement | 2 saved-order failures, no output | 2 passed |
+| Original image/path fixture: single and multiple content streams, short/long | 4 saved-order failures, no output | 4 passed |
+| Original cross-stream translated/scaled CTM + Form graphic, short/long | 2 saved-order failures, no output | 2 passed |
+| 18-page corpus expansion requiring pagination | Unsupported, no output | Still unsupported, no output |
+
+For all 13 produced patched outputs, MuPDF, independent PDFium and pypdf
+returned the exact expected normalized whole-document text, including order.
+MuPDF/PDFium rendered every page; all unedited pages were pixel-identical,
+with no off-page glyphs. Poppler added 24 page comparisons. The coordinator
+inspected edited-page PNGs. Synthetic edge regions were pixel-identical;
+transformed-page coordinates differed only by approximately 0.000061 pt,
+within the documented 0.01 pt measurement tolerance. Image/path fixtures
+deliberately contain a graphical overlay already present in the source;
+preserving it is not evidence of automatic graphic-background reflow.
+
+The default runtime still has the eight stream-order failures; this fix is
+used only when the rebuilt candidate is explicitly selected. These are
+controlled document checks, not BLUE/RED model or scientific-validity scores.
+
+## Remaining implementation boundaries
+
+1. Implement pagination before claiming arbitrary long expansions are safe.
+2. Existing cross-stream z-order is not solved by new-object binding. Tagged
+   MCID spans and ambient operations not owned by page objects are not
+   universally preserved; pure tail appends retain the non-regeneration path.
+3. Add missing-glyph, mixed-font, column, table, equation, rotation/crop, and
    scanned-document cases. They are currently unverified or unsupported.
 
-The supplied WASM has not been independently rebuilt. A website integration
-or production rollout has not been performed.
+Neither a website integration, broker restart, binary publication nor a
+production rollout has been performed. Source patches, build recipes and
+candidate-runtime verification remain distinct from deploying an editor.

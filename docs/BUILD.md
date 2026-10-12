@@ -1,8 +1,9 @@
 # Build and provenance
 
-This module is plain Node.js. It does not compile C++ or WebAssembly. The
-PDF engine it runs is the **upstream committed binary** from the pinned
-engine repository, not a binary this project rebuilt.
+The default Node.js setup does not compile C++ or WebAssembly: it runs the
+**upstream committed binary** from the pinned engine repository. The optional
+source-build script below produces separate local baseline/patched artifacts;
+it does not overwrite the default runtime or change the existing Workbench.
 
 ## Requirements
 
@@ -89,7 +90,7 @@ export BUILD_ROOT=$(mktemp -d "$HOME/editor-wasm-build.XXXXXX")
 scripts/rebuild-wasm.sh fetch toolchain sync prepare configure lib
 SNAPSHOT=baseline scripts/rebuild-wasm.sh exports link snapshot
 # optional extra PDFium patch, then an incremental rebuild:
-PATCH_REPO=pdfium PATCHES=/path/to/fix.patch scripts/rebuild-wasm.sh patch lib exports link
+PATCH_REPO=pdfium PATCHES="$PWD/patches/pdfium-stream-order.patch" scripts/rebuild-wasm.sh patch lib exports link
 SNAPSHOT=patched CANDIDATE_DIR=/new/empty/dir scripts/rebuild-wasm.sh snapshot
 scripts/rebuild-wasm.sh inventory
 ```
@@ -123,6 +124,27 @@ Differences from the upstream container route: no `install-build-deps.sh`
 (not needed for the WebAssembly target), no NodeSource Node.js (emsdk's Node
 runs the export generators), no Rust/watchexec, and Python is the host's
 `python3` for emscripten and depot_tools' own bundled Python for gclient.
+
+### Tested patched artifact (local only)
+
+The stream-order patch SHA-256 is
+`87190eea70e6d99e7a3f408c43c9fdfe3068996bde818beaa94ec7fe46b4c00d`.
+The observed ESM build produced:
+
+| Artifact | SHA-256 |
+|---|---|
+| `pdfium.js` (same wrapper as baseline) | `6e6989a9994715951720e05355111aca7eab898e92b519ebea160167875bb3eb` |
+| `pdfium.wasm` (patched C++ compiled and linked) | `12e43c4c2e7deedab629c3b08b14fc0b24c1336f92b7de30ac58d7ec6dcbb833` |
+
+The baseline compiled all 1,132 ninja steps; after applying the patch, ninja
+rebuilt the content generator and static archive, and em++ relinked the WASM.
+Both variants used the same pinned dependencies and flags. The patched
+artifact passed the coordinator's saved-document corpus checks; see
+[`QUALITY.md`](QUALITY.md). No runtime binary or private corpus is distributed
+in this repository. Select a locally built artifact with
+[`prepare-candidate-runtime.mjs`](CANDIDATE_RUNTIME.md); the manifest itself is
+not a signed build attestation. The collected build inventory contains 244
+third-party notice/license records, not a legal compliance certification.
 
 ## Upstream rebuild route (Linux / Docker, not executed here)
 

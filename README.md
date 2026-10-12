@@ -2,13 +2,13 @@
 
 Experimental, standalone **AGPL-3.0-only** PDF editing module for controlled document-verification research. This is not the Falsify Workbench website and does not include private research material, agent harnesses, or experiment ground truth.
 
-It reuses pinned BentoPDF source and its committed editcore WASM. Input stays on the local machine. No model API, telemetry, remote paper upload, or hosted editor is used.
+It reuses pinned BentoPDF source. By default it runs the committed editcore WASM; an explicitly selected, hash-verified local rebuild can apply the included PDFium source patch. Input stays on the local machine. No model API, telemetry, remote paper upload, or hosted editor is used.
 
 ## Status
 
 Alpha: not a general-purpose PDF editor or a production-quality guarantee. Layout, reading-order, and font coverage limitations must be tested for each document. An engine's successful save is not independent acceptance. The existing Workbench is not automatically connected to this module.
 
-The supplied WASM is hash-checked against a pinned upstream git blob; we have **not independently rebuilt it from C++**. See [build provenance and instructions](docs/BUILD.md).
+An independent local C++ rebuild reproduced the supplied JS/WASM byte-for-byte. A second, patched build fixed the tested inserted-text stream-order failures. This is one host/build comparison, not a universal PDF quality guarantee. See [build provenance and instructions](docs/BUILD.md).
 
 ## Local setup
 
@@ -59,7 +59,7 @@ Use only documents you are entitled to edit. Preserve the clean original, keep e
 - Saved-document text/geometry checks are same-PDFium checks, not independent rendering or external BLUE validation.
 - Unsupported or uncertain layouts require explicit diagnostics, not false success. Multi-column text, scanned pages, tables, equations, mixed fonts, missing glyphs, rotated/cropped pages and pagination are not universally supported.
 
-**Known blocker:** restoring the PDFium object-list index does not necessarily restore the saved content-stream order. Both re-laid-out text and some short surgical replacements can still extract at the end of the page. These outputs fail the mandatory saved-text check; the diagnostic is not a claim of an implemented reading-order fix. Full stream-order repair and pagination remain unfinished. See [tested scope](docs/QUALITY.md).
+**Runtime choice matters:** the default upstream WASM still has inserted-text stream-order failures. The included [C++ patch](docs/STREAM_ORDER.md) and [source rebuild](docs/BUILD.md) fixed the eight tested short/long failure variants when the rebuilt WASM was [explicitly selected](docs/CANDIDATE_RUNTIME.md). Saved-text checks are not weakened. Pagination, arbitrary cross-stream z-order, and other unsupported layouts remain unfinished. See [tested scope](docs/QUALITY.md). The existing Workbench and its running services have not been changed.
 
 ## Source and notices
 

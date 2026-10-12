@@ -43,8 +43,8 @@ existing `.runtime-candidate` that holds nothing but those three files
 (staged with `mkdtemp`, swapped by rename, old copy removed file by file).
 Before writing it verifies the pinned BentoPDF app sources
 (`verifyAppSource`) and the pinned engine checkout. At least one patch is
-required. `.runtime-candidate` is not in `.gitignore`; prefer a parent
-outside the repository.
+required. `.runtime-candidate` and its staging/backup folders are ignored;
+prefer a parent outside the repository to separate local artifacts from code.
 
 ## Manifest (`falsify-editor-candidate-runtime/1`)
 
@@ -90,13 +90,15 @@ entry, never one imported for a different candidate or for the baseline.
 
 The resolver/load hooks are process-global, so `loadRuntime` serializes only
 the temporary hook registration, the engine and editcore graph import, and
-hook deregistration through a process-wide queue (a failed import releases
+hook deregistration through a queue shared by this loader module instance (a failed import releases
 it). Concurrent `loadRuntime` calls (for example `Promise.all` over baseline
 and candidates) therefore each import their own static editcore graph under
 their own tag; manifest checks, cache lookup and every `engineFactory` call
 still run in parallel. This covers the static import graph loaded inside
 that window only: a module the app imports lazily after the hooks are
 deregistered is resolved without them and is not claimed to be isolated.
+Loading another copy of this loader under a different module URL creates a
+separate queue; unrelated external resolver hooks are not governed by it.
 
 `report.runtime.candidate` (and `loadRuntime().info.candidate`) records the
 manifest path and hash, pins, toolchain, patch list, provenance, module tag,
