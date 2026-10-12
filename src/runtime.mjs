@@ -265,6 +265,22 @@ export function resolveCandidateManifest(candidateManifest) {
 
 const loaded = new Map();
 
+// registerHooks hooks are process-global: while importEngine awaits import(),
+// its resolver also sees module loads started by any other concurrent
+// importEngine, so two overlapping windows cross-wire their app graphs (one
+// graph's editcore children resolved under the other's tag). Only the
+// register/import/deregister window is serialized; engineFactory calls and
+// PDF work stay parallel. A rejected import releases the queue.
+let importQueue = Promise.resolve();
+function serializeImport(fn) {
+  const run = importQueue.then(fn);
+  importQueue = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
 // tag is empty for the pinned baseline. For a candidate it is derived from
 // the manifest path and content, appended as a query to the engine JS and
 // the editcore module graph so a changed or relocated candidate never reuses
@@ -333,7 +349,7 @@ export async function loadRuntime({ sourceRoot, runtimeDir, candidateManifest, p
   // engine graph was imported from may have changed since.
   verifyAppSource(root);
   if (!loaded.has(key)) {
-    loaded.set(key, importEngine(root, runtime, tag));
+    loaded.set(key, serializeImport(() => importEngine(root, runtime, tag)));
   }
   let mod;
   try {

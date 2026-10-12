@@ -88,6 +88,16 @@ manifest bytes; the editcore module graph is tagged the same way. A changed
 or relocated candidate therefore gets a fresh module instance and cache
 entry, never one imported for a different candidate or for the baseline.
 
+The resolver/load hooks are process-global, so `loadRuntime` serializes only
+the temporary hook registration, the engine and editcore graph import, and
+hook deregistration through a process-wide queue (a failed import releases
+it). Concurrent `loadRuntime` calls (for example `Promise.all` over baseline
+and candidates) therefore each import their own static editcore graph under
+their own tag; manifest checks, cache lookup and every `engineFactory` call
+still run in parallel. This covers the static import graph loaded inside
+that window only: a module the app imports lazily after the hooks are
+deregistered is resolved without them and is not claimed to be isolated.
+
 `report.runtime.candidate` (and `loadRuntime().info.candidate`) records the
 manifest path and hash, pins, toolchain, patch list, provenance, module tag,
 `trust: "caller-expected-digests"` and `sourceBuildVerified: false`.
