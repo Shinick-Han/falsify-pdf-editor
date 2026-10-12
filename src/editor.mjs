@@ -6,12 +6,21 @@
 // is no fuzzy relocation, implicit selection or shortening of After text.
 // All pages are planned against unchanged snapshots before any commit.
 import { loadRuntime } from "./runtime.mjs";
+import { PAGINATION_CAPABILITY, PAGINATION_LIMITS, paginateOverflow } from "./pagination.mjs";
 
 export const LIMITS = Object.freeze({
   maxFileBytes: 64 * 1024 * 1024,
   maxEdits: 64,
   maxTextChars: 4000,
   maxIdChars: 64,
+});
+
+// What this editor can do, for backends that advertise capabilities.
+// pagination.supported is true only for the scope it describes.
+export const EDITOR_CAPABILITIES = Object.freeze({
+  reflow: true,
+  pagination: PAGINATION_CAPABILITY,
+  limits: LIMITS,
 });
 
 export class EditError extends Error {
@@ -60,6 +69,17 @@ export function validateRequest(request, limits = LIMITS) {
     }
   });
   return { sourceBytes, edits: edits.map((e) => ({ id: e.id, pageIndex: e.pageIndex, before: e.before, after: e.after })), reflow };
+}
+
+function paginationOptions(options) {
+  const bad = (msg) => {
+    throw new EditError("INVALID_REQUEST", msg);
+  };
+  const allow = options.allowPagination ?? true;
+  if (typeof allow !== "boolean") bad("allowPagination must be a boolean");
+  const max = options.maxNewPages ?? PAGINATION_LIMITS.defaultMaxNewPages;
+  if (!Number.isInteger(max) || max < 0 || max > PAGINATION_LIMITS.maxNewPages) bad(`maxNewPages must be an integer from 0 to ${PAGINATION_LIMITS.maxNewPages}`);
+  return { allow, max };
 }
 
 // ---------- alignment (PoC-derived) ----------
@@ -212,11 +232,15 @@ function captureConsole(keepText) {
  * editPdf({ sourceBytes, edits, reflow }, options?) => { pdf, report }
  *
  * options: sourceRoot, runtimeDir, includeEngineLog (default false),
+ * allowPagination (default true), maxNewPages (document-wide budget,
+ * default 8, at most 32), includeFlowText (default false: expected flow
+ * text is reported as sha256/length only),
  * quality / engineFactory (test seams).
  * Throws EditError on any definite failure; err.report carries diagnostics.
  */
 export async function editPdf(request, options = {}) {
   const { sourceBytes, edits, reflow } = validateRequest(request, options.limits ?? LIMITS);
+  const pg = paginationOptions(options);
   const quality = await loadQuality(options.quality);
   for (const fn of ["capturePageLayout", "repairPageLayout", "inspectSavedPdf"]) {
     if (typeof quality[fn] !== "function") throw new EditError("QUALITY_UNAVAILABLE", `Quality module lacks ${fn}`);
@@ -251,12 +275,16 @@ export async function editPdf(request, options = {}) {
   const logCapture = captureConsole(!!options.includeEngineLog);
   let engine;
   let pdf;
+  let sourcePageCount = 0;
+  const continued = new Map();
+  let added = 0;
   try {
     try {
       engine = await engineFactory(sourceBytes);
     } catch (err) {
       throw fail("OPEN_FAILED", err.passwordRequired ? "Source PDF is password-protected" : "Source PDF could not be opened");
     }
+    sourcePageCount = engine.pageCount;
     const outOfRange = edits.filter((e) => e.pageIndex >= engine.pageCount);
     if (outOfRange.length) {
       for (const e of outOfRange) editReport.get(e.id).status = "page-out-of-range";
@@ -280,6 +308,9 @@ export async function editPdf(request, options = {}) {
     }
 
     // Phase 2: per page, re-verify the snapshot, capture layout, commit, repair.
+    // Pages are processed in source order; continuation pages inserted after
+    // a page shift every later page by `added`, so the engine addresses
+    // source page p at p + added (pagination evicts stale cache entries).
     let mutated = false;
     for (const { pageIndex, plan, key, regenHostile } of pagePlans) {
       const pageReport = { pageIndex, paragraphs: [], regenHostile };
@@ -292,10 +323,11 @@ export async function editPdf(request, options = {}) {
         });
       }
       if (plan.perPara.size === 0) continue;
-      engine.loadPage(pageIndex);
+      const at = pageIndex + added;
+      engine.loadPage(at);
       const paras = engine.buildModel();
       if (snapshotKey(paras) !== key) throw fail("STATE_DRIFT", "Page model changed between planning and commit", { pageIndex });
-      const context = quality.capturePageLayout(engine, pageIndex, paras);
+      const context = quality.capturePageLayout(engine, at, paras);
       const touched = [];
       for (const [pi, { del, inserts }] of [...plan.perPara.entries()].sort((x, y) => x[0] - y[0])) {
         const para = paras[pi];
@@ -308,8 +340,11 @@ export async function editPdf(request, options = {}) {
       }
       if (reflow) {
         let r;
+        const repairOptions = pg.allow
+          ? { paginate: (eng, ctx, grown, info) => paginateOverflow(eng, ctx, grown, { ...info, maxNewPages: pg.max - added }) }
+          : {};
         try {
-          r = quality.repairPageLayout(engine, pageIndex, context, touched);
+          r = quality.repairPageLayout(engine, at, context, touched, repairOptions);
         } catch (err) {
           throw fail("REPAIR_FAILED", "Layout repair raised an error", { pageIndex, cause: err?.code ?? err?.name ?? "Error" });
         }
@@ -319,11 +354,18 @@ export async function editPdf(request, options = {}) {
         // severity:error is a definite repair failure; warning/info are reported only.
         const errors = pageWarnings.filter((w) => w.severity === "error");
         if (errors.length) {
+          if (errors.some((w) => w.code === "pagination_budget_exceeded")) {
+            throw fail("PAGINATION_LIMIT", `Edit on page ${pageIndex} needs more than the ${pg.max} allowed new page(s)`, { pageIndex, maxNewPages: pg.max });
+          }
           const unsupported = errors.some((w) => /unsupported/.test(String(w.code)));
           throw fail(unsupported ? "LAYOUT_UNSUPPORTED" : "REPAIR_FAILED", `Layout repair reported ${errors.length} error(s) on page ${pageIndex}`, {
             pageIndex,
             codes: errors.map((w) => w.code),
           });
+        }
+        if (r?.pagination?.added > 0) {
+          continued.set(pageIndex, r.pagination);
+          added += r.pagination.added;
         }
       }
       for (const p of plan.plans) if (!p.noop) editReport.get(p.edit.id).status = "applied";
@@ -344,11 +386,30 @@ export async function editPdf(request, options = {}) {
     report.engineLog = logCapture.restore();
   }
 
+  // Source page -> output pages. Downstream pages keep their content and
+  // only shift by the continuation pages inserted before them.
+  const sourcePageMap = [];
+  for (let s = 0, out = 0; s < sourcePageCount; s++) {
+    const c = continued.get(s);
+    const n = c?.added ?? 0;
+    const entry = { sourcePageIndex: s, outputPageIndex: out, continuationPageIndices: Array.from({ length: n }, (_, k) => out + 1 + k) };
+    if (c) Object.assign(entry, { lineCounts: [...c.lineCounts], keptLines: c.keptLines, bodyTop: c.bodyTop, floor: c.floor });
+    sourcePageMap.push(entry);
+    out += 1 + n;
+  }
+  report.pagination = {
+    enabled: pg.allow,
+    maxNewPages: pg.max,
+    pages: { source: sourcePageCount, output: sourcePageCount + added },
+    addedPages: added,
+    sourcePageMap,
+  };
+
   // Same-engine self-check on a freshly reopened copy.
   const qaCapture = captureConsole(!!options.includeEngineLog);
   let check;
   try {
-    check = await quality.inspectSavedPdf(engineFactory, sourceBytes, pdf, edits);
+    check = await quality.inspectSavedPdf(engineFactory, sourceBytes, pdf, edits, { sourcePageMap, includeText: !!options.includeFlowText });
   } catch (err) {
     report.selfCheck = { status: "error", error: err?.code ?? err?.name ?? "Error" };
     throw fail("SELF_CHECK_FAILED", "Saved-PDF self-check could not run");
@@ -356,6 +417,17 @@ export async function editPdf(request, options = {}) {
     report.selfCheckLog = qaCapture.restore();
   }
   report.selfCheck = { status: check?.ok === true ? "passed" : "failed", ...check };
+  report.pagination.flow = (check?.pages ?? [])
+    .filter((row) => row.continuationPageIndices?.length)
+    .map((row) => ({
+      sourcePageIndex: row.pageIndex,
+      outputPageIndices: [row.outputPageIndex, ...row.continuationPageIndices],
+      bodyBand: row.body_band,
+      expectedText: row.expected_text,
+      outputParts: row.output_parts,
+      measuredLines: (row.continuation ?? []).map((c) => c.lines),
+      textEqual: row.text_equal === true,
+    }));
   const unapplied = report.edits.filter((r) => r.status !== "applied" && r.status !== "noop");
   if (unapplied.length) throw fail("EDIT_NOT_APPLIED", "Some requested edits were not applied", { ids: unapplied.map((r) => r.id) });
   if (check?.ok !== true) throw fail("SELF_CHECK_FAILED", "Saved-PDF self-check reported failures");

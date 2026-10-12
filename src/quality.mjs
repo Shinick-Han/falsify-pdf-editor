@@ -2,14 +2,20 @@
 //
 // Shared contract with the core editor:
 //   capturePageLayout(engine, pageIndex, paragraphs) => context
-//   repairPageLayout(engine, pageIndex, context, touched) => { repairs, warnings }
-//   inspectSavedPdf(engineFactory, sourceBytes, outputBytes, edits) => report
+//   repairPageLayout(engine, pageIndex, context, touched, options?) => { repairs, warnings, pagination? }
+//   inspectSavedPdf(engineFactory, sourceBytes, outputBytes, edits, options?) => report
+//
+// options.paginate (repair) is called when the cascade has no room; without
+// it overflow stays a pagination_unsupported error. options.sourcePageMap
+// (inspect) maps each source page to its output page and continuation pages.
 //
 // Object handles are compared as integers only. A handle captured before a
 // commit is never passed back to PDFium; only handles enumerated from the
 // current page (or returned by paragraphObjects on the current page) are.
 // inspectSavedPdf uses the same PDFium build as the editor, so it is a
 // self-check, not an independent or rendering-based release check.
+
+import { createHash } from "node:crypto";
 
 const TOL = 1;
 const EDGE_BAND = 0.1;
@@ -164,7 +170,7 @@ function restorePitch(engine, id, rz, pitch) {
   return { ok: true, dyLast: lines[0] - last * pitch - lines[last], moved };
 }
 
-export function repairPageLayout(engine, pageIndex, context, touched) {
+export function repairPageLayout(engine, pageIndex, context, touched, options = {}) {
   const repairs = [];
   const warnings = [];
   if (!context || context.pageIndex !== pageIndex) {
@@ -224,16 +230,24 @@ export function repairPageLayout(engine, pageIndex, context, touched) {
     if (delta > 0.5) grown.push({ id: t.id, box: t.sourceBox, delta });
   }
 
-  if (grown.length) cascade(engine, context, grown, new Set(order.map((t) => t.id)), repairs, warnings);
+  const paginate = typeof options.paginate === "function" ? options.paginate : null;
+  const overflow = grown.length ? cascade(engine, context, grown, new Set(order.map((t) => t.id)), repairs, warnings, !!paginate) : null;
   restoreSourceOrder(engine, context, repairs, warnings);
-  return { repairs, warnings };
+  if (!overflow) return { repairs, warnings };
+  // Order is restored before any object leaves the page, so moved lines keep
+  // their source object order on the continuation pages.
+  const p = paginate(engine, context, grown, { floor: overflow.floor });
+  repairs.push(...(p?.repairs ?? []));
+  warnings.push(...(p?.warnings ?? []));
+  return { repairs, warnings, pagination: p?.ok ? { added: p.added, lineCounts: p.lineCounts, keptLines: p.keptLines, bodyTop: p.bodyTop, floor: p.floor } : null };
 }
 
 // Shift following body paragraphs of the same column by the growth above
 // them. Edge paragraphs (headers, footers, page numbers) never move. If the
 // shift would push body text into the footer zone, nothing is moved and the
-// overflow is reported: pagination is not supported.
-function cascade(engine, ctx, grown, touchedIds, repairs, warnings) {
+// overflow is reported as pagination_unsupported, or, when the caller can
+// paginate, returned as { floor } for the continuation-page flow.
+function cascade(engine, ctx, grown, touchedIds, repairs, warnings, allowOverflow = false) {
   const edgeTops = ctx.paras.filter((q) => q.box && q.role !== "body" && q.box.top < ctx.pageH / 2).map((q) => q.box.top);
   const bodyBottoms = ctx.paras.filter((q) => q.box && q.role === "body").map((q) => bottomOf(q.box));
   const floor = edgeTops.length ? Math.max(...edgeTops) + 2 : Math.min(...bodyBottoms, Infinity);
@@ -254,9 +268,14 @@ function cascade(engine, ctx, grown, touchedIds, repairs, warnings) {
   // Growth of the last paragraph itself must also fit.
   for (const g of grown) if (bottomOf(g.box) - g.delta < floor - 0.01) violations.push(g.id);
   if (violations.length) {
+    if (allowOverflow) {
+      warnings.push({ code: "pagination_required", severity: "info", paragraphs: violations, floor: +floor.toFixed(2) });
+      repairs.push({ kind: "cascade", action: "deferred_to_pagination", moved: 0 });
+      return { floor };
+    }
     warnings.push({ code: "pagination_unsupported", severity: "error", paragraphs: violations, floor: +floor.toFixed(2) });
     repairs.push({ kind: "cascade", action: "skipped_no_room", moved: 0 });
-    return;
+    return null;
   }
   let moved = 0;
   for (const [id, dy] of plan) {
@@ -268,6 +287,7 @@ function cascade(engine, ctx, grown, touchedIds, repairs, warnings) {
     moved++;
   }
   repairs.push({ kind: "cascade", action: "shifted", moved, floor: +floor.toFixed(2) });
+  return null;
 }
 
 // Put every paragraph whose objects were replaced back into the source
@@ -408,25 +428,33 @@ function readGlyphs(engine, pageIndex) {
   const b = M._malloc(32);
   let text = "";
   const glyphs = [];
+  const chars = [];
   for (let i = 0; i < n; i++) {
     const u = M._FPDFText_GetUnicode(tp, i);
     text += String.fromCharCode(u);
-    if (u <= 32) continue;
-    if (!M._FPDFText_GetCharBox(tp, i, b, b + 8, b + 16, b + 24)) continue;
+    if (u <= 32 || !M._FPDFText_GetCharBox(tp, i, b, b + 8, b + 16, b + 24)) {
+      chars.push({ u, cy: null });
+      continue;
+    }
     const l = M.HEAPF64[b >> 3], r = M.HEAPF64[(b + 8) >> 3];
     const bo = M.HEAPF64[(b + 16) >> 3], t = M.HEAPF64[(b + 24) >> 3];
-    glyphs.push({ u, l, r, b: bo, t });
+    glyphs.push({ u, l, r, b: bo, t, i });
+    chars.push({ u, cy: (bo + t) / 2 });
   }
   M._free(b);
   if (tp) M._FPDFText_ClosePage(tp);
-  return { text, glyphs, W: M._FPDF_GetPageWidthF(engine.page), H: M._FPDF_GetPageHeightF(engine.page) };
+  return { text, glyphs, chars, W: M._FPDF_GetPageWidthF(engine.page), H: M._FPDF_GetPageHeightF(engine.page) };
 }
 
 function offPage(g) {
   return g.glyphs.filter((c) => c.r > g.W + 0.5 || c.l < -0.5 || c.b < -0.5 || c.t > g.H + 0.5).length;
 }
 
-function overlaps(g) {
+// adjacentKerning: pairs that are consecutive in text order on one baseline
+// (kerned or ligature-like pairs such as "fi" in the source font) are type
+// metrics, not layout collisions; the continued-flow check excludes them on
+// both sides of the comparison.
+function overlaps(g, adjacentKerning = false) {
   const cell = 12;
   const grid = new Map();
   let count = 0;
@@ -440,6 +468,7 @@ function overlaps(g) {
           if (seen.has(j)) continue;
           seen.add(j);
           const d = g.glyphs[j];
+          if (adjacentKerning && Math.abs(c.i - d.i) === 1 && Math.abs(c.b - d.b) <= 0.5) continue;
           const iw = Math.min(c.r, d.r) - Math.max(c.l, d.l);
           const ih = Math.min(c.t, d.t) - Math.max(c.b, d.b);
           if (iw <= 0 || ih <= 0) continue;
@@ -492,7 +521,7 @@ export function expectedPageText(sourceText, pageEdits) {
   return { ok: true, text: normStr(out + norm.slice(at)) };
 }
 
-export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, edits) {
+export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, edits, options = {}) {
   const failures = [];
   const warnings = [];
   const pages = [];
@@ -503,20 +532,30 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
     out = await engineFactory();
     src.open(sourceBytes);
     out.open(outputBytes);
-    report.page_count = { source: src.pageCount, output: out.pageCount };
-    if (src.pageCount !== out.pageCount) failures.push({ code: "page_count_changed" });
+    const map = normalizePageMap(options.sourcePageMap, src.pageCount);
+    const expectedOut = map ? map.reduce((n, m) => n + 1 + m.continuationPageIndices.length, 0) : src.pageCount;
+    report.page_count = { source: src.pageCount, output: out.pageCount, expected: expectedOut, added: expectedOut - src.pageCount };
+    if (!map) failures.push({ code: "page_map_invalid" });
+    if (out.pageCount !== expectedOut) failures.push({ code: expectedOut === src.pageCount ? "page_count_changed" : "page_count_mismatch" });
     const byPage = new Map();
     for (const e of edits || []) byPage.set(e.pageIndex, [...(byPage.get(e.pageIndex) || []), e]);
     for (const p of byPage.keys()) {
       if (!(p >= 0 && p < src.pageCount)) failures.push({ code: "edit_page_out_of_range", pageIndex: p });
     }
-    const n = Math.min(src.pageCount, out.pageCount);
+    const n = map && out.pageCount === expectedOut ? src.pageCount : map ? 0 : Math.min(src.pageCount, out.pageCount);
     for (let i = 0; i < n; i++) {
+      const m = map ? map[i] : { outputPageIndex: i, continuationPageIndices: [] };
       const s = readGlyphs(src, i);
-      const o = readGlyphs(out, i);
+      const o = readGlyphs(out, m.outputPageIndex);
       const pageEdits = byPage.get(i) || [];
-      const row = { pageIndex: i, edited: pageEdits.length > 0 };
+      const row = { pageIndex: i, outputPageIndex: m.outputPageIndex, edited: pageEdits.length > 0 };
       pages.push(row);
+      if (m.continuationPageIndices.length) {
+        row.continuationPageIndices = [...m.continuationPageIndices];
+        if (!pageEdits.length) failures.push({ code: "continuation_without_edit", pageIndex: i });
+        else inspectContinued(s, o, out, m, pageEdits, row, failures, warnings, !!options.includeText);
+        continue;
+      }
       if (!pageEdits.length) {
         row.text_equal = normStr(s.text) === normStr(o.text);
         if (!row.text_equal) failures.push({ code: "unedited_page_text_changed", pageIndex: i });
@@ -527,6 +566,7 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
         failures.push({ code: "expected_text_uncomputable", pageIndex: i, id: exp.id, reason: exp.reason });
       } else {
         row.text_equal = exp.text === normStr(o.text);
+        row.expected_text = digest(exp.text, options.includeText);
         if (!row.text_equal) failures.push({ code: "edited_page_text_or_order_mismatch", pageIndex: i });
         for (const e of pageEdits) {
           const t = normStr(o.text);
@@ -541,10 +581,7 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
       row.extents = { source: se, output: oe };
       if (se && oe && (oe.right > se.right + TOL || oe.left < se.left - TOL)) failures.push({ code: "text_outside_source_columns", pageIndex: i });
       const es = edgeGlyphs(s), eo = edgeGlyphs(o);
-      const stable = es.length === eo.length && es.every((c, k) => {
-        const d = eo[k];
-        return c.u === d.u && Math.abs(c.l - d.l) <= 0.5 && Math.abs(c.b - d.b) <= 0.5;
-      });
+      const stable = sameGlyphs(es, eo);
       row.edge_glyphs = es.length;
       row.edge_stable = stable;
       if (!stable) {
@@ -564,4 +601,146 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
     try { out?.close(); } catch {}
   }
   return report;
+}
+
+const sameGlyphs = (a, b) => a.length === b.length && a.every((c, k) => {
+  const d = b[k];
+  return c.u === d.u && Math.abs(c.l - d.l) <= 0.5 && Math.abs(c.b - d.b) <= 0.5;
+});
+
+const digest = (text, includeText) => ({
+  sha256: createHash("sha256").update(text, "utf8").digest("hex"),
+  chars: text.length,
+  ...(includeText ? { text } : {}),
+});
+
+// Identity when absent. Otherwise one entry per source page whose output
+// indices are consecutive from 0: [output, ...continuation] per source page.
+export function normalizePageMap(map, sourcePageCount) {
+  if (map === undefined || map === null) {
+    return Array.from({ length: sourcePageCount }, (_, i) => ({ sourcePageIndex: i, outputPageIndex: i, continuationPageIndices: [] }));
+  }
+  if (!Array.isArray(map) || map.length !== sourcePageCount) return null;
+  let next = 0;
+  const out = [];
+  for (let i = 0; i < map.length; i++) {
+    const m = map[i];
+    const cont = m?.continuationPageIndices ?? [];
+    if (!m || m.sourcePageIndex !== i || m.outputPageIndex !== next || !Array.isArray(cont)) return null;
+    next++;
+    for (const c of cont) {
+      if (c !== next) return null;
+      next++;
+    }
+    if (cont.length && !(Number.isFinite(m.bodyTop) && Number.isFinite(m.floor) && m.bodyTop > m.floor)) return null;
+    if (cont.length && !(Array.isArray(m.lineCounts) && m.lineCounts.length === cont.length)) return null;
+    out.push({ ...m, continuationPageIndices: [...cont] });
+  }
+  return out;
+}
+
+// Text of the body band only: whitespace and line breaks are kept, glyphs
+// whose centre lies outside [floor, bodyTop] (headers, footers, page
+// numbers) are dropped so they can be compared separately by position.
+function bandText(g, floor, bodyTop) {
+  let t = "";
+  for (const c of g.chars) if (c.cy === null || (c.cy >= floor && c.cy <= bodyTop)) t += String.fromCharCode(c.u);
+  return t;
+}
+
+function outsideBand(g, floor, bodyTop) {
+  return g.glyphs.filter((c) => {
+    const cy = (c.b + c.t) / 2;
+    return cy < floor || cy > bodyTop;
+  });
+}
+
+// Measured text lines: glyphs grouped by vertical-centre membership.
+export function countGlyphLines(glyphs) {
+  const sorted = [...glyphs].sort((a, b) => b.t - a.t);
+  let n = 0, top = 0, bottom = 0;
+  for (const c of sorted) {
+    const cy = (c.b + c.t) / 2;
+    if (n && cy <= top && cy >= bottom) {
+      bottom = Math.min(bottom, c.b);
+      continue;
+    }
+    n++;
+    top = c.t;
+    bottom = c.b;
+  }
+  return n;
+}
+
+// Joins page parts in order. A part ending in "-" whose expected text has a
+// soft hyphen (U+0002 from PDFium) at that point is the same hyphen object
+// that PDFium renders as "-" at a page end; it is joined without a space.
+// Every other boundary is a plain space.
+export function joinFlowParts(parts, expected) {
+  let acc = parts[0] ?? "";
+  let softJoins = 0;
+  for (const part of parts.slice(1)) {
+    if (acc.endsWith("-") && expected.startsWith(acc.slice(0, -1) + "\u0002")) {
+      acc = acc.slice(0, -1) + "\u0002" + part;
+      softJoins++;
+    } else {
+      acc = acc + " " + part;
+    }
+  }
+  return { text: normStr(acc), softJoins };
+}
+
+// A source page whose flow continues on new pages: the body-band text of
+// the output page followed by every continuation page must equal the
+// source body-band text with the edits applied, in order; everything
+// outside the band must be glyph-for-glyph where it was.
+function inspectContinued(s, o, out, m, pageEdits, row, failures, warnings, includeText) {
+  const i = row.pageIndex;
+  const { floor, bodyTop } = m;
+  const lo = floor - 0.5, hi = bodyTop + 0.5;
+  const exp = expectedPageText(bandText(s, lo, hi), pageEdits);
+  const conts = m.continuationPageIndices.map((k) => readGlyphs(out, k));
+  const parts = [bandText(o, lo, hi), ...conts.map((g) => g.text)].map(normStr);
+  const joined = joinFlowParts(parts, exp.ok ? exp.text : "");
+  const got = joined.text;
+  row.body_band = { floor: +floor.toFixed(2), bodyTop: +bodyTop.toFixed(2) };
+  row.soft_hyphen_page_joins = joined.softJoins;
+  if (!exp.ok) {
+    failures.push({ code: "expected_text_uncomputable", pageIndex: i, id: exp.id, reason: exp.reason });
+  } else {
+    row.text_equal = exp.text === got;
+    row.expected_text = digest(exp.text, includeText);
+    row.output_parts = parts.map((p) => digest(p, includeText));
+    if (!row.text_equal) failures.push({ code: "edited_flow_text_or_order_mismatch", pageIndex: i });
+  }
+  if (parts.slice(1).some((p) => !p)) failures.push({ code: "continuation_page_empty", pageIndex: i });
+  const es = outsideBand(s, lo, hi), eo = outsideBand(o, lo, hi);
+  row.edge_glyphs = es.length;
+  row.edge_stable = sameGlyphs(es, eo);
+  if (!row.edge_stable) failures.push({ code: "header_footer_moved", pageIndex: i });
+  const se = extents(s);
+  row.continuation = conts.map((g, k) => {
+    const c = {
+      outputPageIndex: m.continuationPageIndices[k],
+      lines: { planned: m.lineCounts[k], measured: countGlyphLines(g.glyphs) },
+      offpage: offPage(g),
+      overlap: overlaps(g, true),
+      outside_band: outsideBand(g, lo, hi).length,
+      extents: extents(g),
+      size: { W: g.W, H: g.H },
+    };
+    if (c.lines.planned !== c.lines.measured) failures.push({ code: "continuation_line_count_mismatch", pageIndex: i, outputPageIndex: c.outputPageIndex });
+    if (c.offpage) failures.push({ code: "glyphs_off_page", pageIndex: i, outputPageIndex: c.outputPageIndex, count: c.offpage });
+    if (c.overlap > overlaps(s, true)) failures.push({ code: "glyph_overlap_increased", pageIndex: i, outputPageIndex: c.outputPageIndex });
+    if (c.outside_band) failures.push({ code: "continuation_outside_body_band", pageIndex: i, outputPageIndex: c.outputPageIndex });
+    if (se && c.extents && (c.extents.right > se.right + TOL || c.extents.left < se.left - TOL)) failures.push({ code: "text_outside_source_columns", pageIndex: i, outputPageIndex: c.outputPageIndex });
+    if (Math.abs(g.W - s.W) > 0.01 || Math.abs(g.H - s.H) > 0.01) failures.push({ code: "continuation_page_size_mismatch", pageIndex: i, outputPageIndex: c.outputPageIndex });
+    return c;
+  });
+  row.offpage = { source: offPage(s), output: offPage(o) };
+  if (row.offpage.output > row.offpage.source) failures.push({ code: "glyphs_off_page", pageIndex: i, count: row.offpage.output - row.offpage.source });
+  row.overlap = { source: overlaps(s, true), output: overlaps(o, true), excludes: "adjacent_same_baseline_pairs" };
+  if (row.overlap.output > row.overlap.source) failures.push({ code: "glyph_overlap_increased", pageIndex: i, count: row.overlap.output - row.overlap.source });
+  const oe = extents(o);
+  if (se && oe && (oe.right > se.right + TOL || oe.left < se.left - TOL)) failures.push({ code: "text_outside_source_columns", pageIndex: i });
 }
