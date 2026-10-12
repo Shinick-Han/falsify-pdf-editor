@@ -15,9 +15,14 @@
 // else (multi-column, foreign images/paths or unassignable text inside the
 // flow, edge paragraphs inside the flow, shared objects, form-XObject text)
 // is reported as an explicit *_unsupported error before anything moves.
-// Continuation pages carry only moved body lines: no header, footer, page
-// number or label is copied or synthesized, and original page numbers stay
-// on their source pages (see docs/PAGINATION.md for the page map contract).
+// Continuation pages carry the moved body lines plus source-style copies of
+// the source page's edge text (running headers/footers in the source font,
+// size, colour, render mode, matrix and position; a standalone Arabic page
+// number as source number plus decimal suffix, see continuation-template.mjs).
+// Original edge objects and page numbers are never moved or changed; no
+// label is synthesized (see docs/PAGINATION.md for the page map contract).
+
+import { CONTINUATION_STYLE, applyPageEdges, preflightPageEdges, snapshotPageEdges, verifyPageEdges } from "./continuation-template.mjs";
 
 const OBJ_TEXT = 1;
 const EPS = 0.01;
@@ -27,8 +32,9 @@ export const PAGINATION_LIMITS = Object.freeze({ defaultMaxNewPages: 8, maxNewPa
 export const PAGINATION_CAPABILITY = Object.freeze({
   supported: true,
   scope: "single-column top-level body text flow below the edited paragraph on unrotated, uncropped pages",
-  continuationPages: "same size as the source page, inserted directly after it, body lines only; no copied or synthesized header, footer, page number or label",
+  continuationPages: "same size as the source page, inserted directly after it; moved body lines plus source-style copies of the source page's header/footer text; a standalone Arabic page number becomes source number plus decimal suffix (10.1, 10.2); no synthesized label",
   sourcePageNumbers: "unchanged; existing page-number objects stay on their source page",
+  continuationStyle: Object.freeze({ version: CONTINUATION_STYLE.version, policy: CONTINUATION_STYLE.policy }),
   downstreamPages: "never modified; only their output index shifts, see report.pagination.sourcePageMap",
   maxNewPagesDefault: PAGINATION_LIMITS.defaultMaxNewPages,
   maxNewPagesLimit: PAGINATION_LIMITS.maxNewPages,
@@ -41,6 +47,12 @@ export const PAGINATION_CAPABILITY = Object.freeze({
     "type3_segments",
     "non_top_level_text",
     "shared_objects",
+    "edge_graphics",
+    "edge_text_layout",
+    "edge_style",
+    "ambiguous_page_number",
+    "page_number_spacing",
+    "page_number_glyph_missing",
   ]),
 });
 
@@ -245,6 +257,8 @@ export function buildFlowPlan(engine, ctx, grown, { floor, maxNewPages }) {
   return { ok: true, lines, pages: split.pages, bodyTop, floor, orphans, objects };
 }
 
+const coded = (code) => Object.assign(new Error(code), { code });
+
 // Closes cached page handles above pageIndex; their content was generated
 // when the engine switched away from them, and their cache keys are about
 // to name different pages.
@@ -262,9 +276,13 @@ function evictPagesAfter(engine, pageIndex) {
 
 // Applies a flow plan: shift kept lines, generate the source page so every
 // object has a content stream, then move continuation lines (in source
-// object order) onto new pages inserted after pageIndex. Throws on any
-// engine refusal; the caller discards the whole document then.
-export function applyFlowPlan(engine, pageIndex, plan) {
+// object order) onto new pages inserted after pageIndex, between the
+// source-style edge clones of the page edges. `edges` is the pre-mutation
+// snapshotPageEdges result; the source page is re-snapshotted after its
+// content is generated because font dealiasing there may replace edge
+// objects (and their handles). Throws on any engine refusal or clone
+// mismatch; the caller discards the whole document then.
+export function applyFlowPlan(engine, pageIndex, plan, edges = null) {
   const M = engine.M;
   if (engine.pageIndex !== pageIndex) throw new Error("page_not_current");
   for (const [p, page] of plan.pages.entries()) {
@@ -280,10 +298,20 @@ export function applyFlowPlan(engine, pageIndex, plan) {
   const added = plan.pages.length - 1;
   const lineCounts = [];
   if (added > 0) {
+    if (edges) {
+      const fresh = snapshotPageEdges(engine, plan.floor, plan.bodyTop);
+      if (!fresh.ok) throw coded(fresh.code);
+      const key = (s) => JSON.stringify(s.items.map((i) => [i.role, i.text, i.chars.map((c) => [c.u, c.ox.toFixed(2), c.oy.toFixed(2)])]));
+      if (key(fresh) !== key(edges)) throw coded("continuation_edge_snapshot_drift");
+      const pre = preflightPageEdges(engine, fresh, added);
+      if (!pre.ok) throw coded(pre.code);
+      edges = fresh;
+    }
     evictPagesAfter(engine, pageIndex);
     const W = engine.pageWidth, H = engine.pageHeight;
     const before = M._FPDFPage_CountObjects(engine.page);
     let movedTotal = 0;
+    let copiedEdges = 0;
     for (let p = 1; p <= added; p++) {
       const np = M._FPDFPage_New(engine.doc, pageIndex + p, W, H);
       if (!np) throw new Error("page_new_failed");
@@ -292,13 +320,25 @@ export function applyFlowPlan(engine, pageIndex, plan) {
         const handles = plan.pages[p].lines.flatMap((i) => plan.lines[i].items.map((it) => it.h));
         if (handles.some((h) => !now.has(h))) throw new Error("object_not_on_source_page");
         handles.sort((a, b) => now.get(a) - now.get(b));
+        // Edge clones keep their source stream position relative to the body.
+        const bodyIndex = edges ? Math.min(...handles.map((h) => edges.order.get(h) ?? Infinity)) : Infinity;
+        const applied = edges ? applyPageEdges(engine, np, edges, p, bodyIndex) : { ok: true, items: [], bodyAt: 0 };
+        if (!applied.ok) throw coded(applied.code);
+        // Clones first get their own content stream; see applyPageEdges.
+        if (applied.items.length && !M._FPDFPage_GenerateContent(np)) throw new Error("continuation_generate_failed");
+        let at = applied.bodyAt;
         for (const h of handles) {
           if (!M._FPDFPage_RemoveObject(engine.page, h)) throw new Error("remove_failed");
-          M._FPDFPage_InsertObject(np, h);
+          if (!M._FPDFPage_InsertObjectAtIndex(np, h, at++)) throw new Error("insert_failed");
         }
-        if (M._FPDFPage_CountObjects(np) !== handles.length) throw new Error("insert_count_mismatch");
+        if (M._FPDFPage_CountObjects(np) !== handles.length + applied.items.length) throw new Error("insert_count_mismatch");
+        if (edges) {
+          const proof = verifyPageEdges(engine, np, edges, p, applied);
+          if (!proof.ok) throw coded(proof.code);
+        }
         if (!M._FPDFPage_GenerateContent(np)) throw new Error("continuation_generate_failed");
         movedTotal += handles.length;
+        copiedEdges += applied.items.length;
         lineCounts.push(plan.pages[p].lines.length);
       } finally {
         M._FPDF_ClosePage(np);
@@ -313,30 +353,45 @@ export function applyFlowPlan(engine, pageIndex, plan) {
     engine._pageStale = true;
     engine.buildModel();
     engine.pageCount = M._FPDF_GetPageCount(engine.doc);
+    return { added, lineCounts, keptLines: plan.pages[0].lines.length, copiedEdges };
   }
-  return { added, lineCounts, keptLines: plan.pages[0].lines.length };
+  return { added, lineCounts, keptLines: plan.pages[0].lines.length, copiedEdges: 0 };
 }
 
 // quality.repairPageLayout hook: plan, then apply. Returns
-// { ok, warnings, repairs, added, lineCounts, bodyTop, floor }.
+// { ok, warnings, repairs, added, lineCounts, bodyTop, floor, continuationStyle }.
+// Edge snapshot and suffix-glyph preflight run before anything moves, so
+// unsupported edges are rejected with their specific code.
 export function paginateOverflow(engine, ctx, grown, { floor, maxNewPages }) {
   const warnings = [];
   const repairs = [];
-  const plan = buildFlowPlan(engine, ctx, grown, { floor, maxNewPages });
-  if (!plan.ok) {
-    warnings.push({ code: plan.code, severity: "error", ...(plan.maxNewPages !== undefined ? { maxNewPages: plan.maxNewPages } : {}) });
-    repairs.push({ kind: "pagination", action: "rejected", reason: plan.code });
+  const reject = (code, extra = {}) => {
+    warnings.push({ code, severity: "error", ...extra });
+    repairs.push({ kind: "pagination", action: "rejected", reason: code });
     return { ok: false, warnings, repairs, added: 0 };
+  };
+  const plan = buildFlowPlan(engine, ctx, grown, { floor, maxNewPages });
+  if (!plan.ok) return reject(plan.code, plan.maxNewPages !== undefined ? { maxNewPages: plan.maxNewPages } : {});
+  let edges = null;
+  if (plan.pages.length > 1) {
+    // Flow lines (including the grown paragraph still overflowing the
+    // floor) are body, not edges.
+    const flow = new Set(plan.lines.flatMap((l) => l.items.map((it) => it.h)));
+    edges = snapshotPageEdges(engine, plan.floor, plan.bodyTop, flow);
+    if (!edges.ok) return reject(edges.code);
+    const pre = preflightPageEdges(engine, edges, plan.pages.length - 1);
+    if (!pre.ok) return reject(pre.code);
   }
   let r;
   try {
-    r = applyFlowPlan(engine, ctx.pageIndex, plan);
+    r = applyFlowPlan(engine, ctx.pageIndex, plan, edges);
   } catch (e) {
-    warnings.push({ code: "pagination_apply_failed", severity: "error", reason: String(e?.message || e).slice(0, 80) });
+    warnings.push(e?.code ? { code: e.code, severity: "error" } : { code: "pagination_apply_failed", severity: "error", reason: String(e?.message || e).slice(0, 80) });
     repairs.push({ kind: "pagination", action: "failed" });
     return { ok: false, warnings, repairs, added: 0 };
   }
   if (plan.orphans) warnings.push({ code: "pagination_empty_objects_kept", severity: "info", count: plan.orphans });
-  repairs.push({ kind: "pagination", action: r.added ? "continued" : "shifted", added: r.added, keptLines: r.keptLines, lineCounts: r.lineCounts, floor: +plan.floor.toFixed(2), bodyTop: +plan.bodyTop.toFixed(2) });
-  return { ok: true, warnings, repairs, added: r.added, lineCounts: r.lineCounts, keptLines: r.keptLines, bodyTop: plan.bodyTop, floor: plan.floor };
+  repairs.push({ kind: "pagination", action: r.added ? "continued" : "shifted", added: r.added, keptLines: r.keptLines, lineCounts: r.lineCounts, copiedEdges: r.copiedEdges, floor: +plan.floor.toFixed(2), bodyTop: +plan.bodyTop.toFixed(2) });
+  const continuationStyle = r.added ? { version: CONTINUATION_STYLE.version, policy: CONTINUATION_STYLE.policy, applied: true } : undefined;
+  return { ok: true, warnings, repairs, added: r.added, lineCounts: r.lineCounts, keptLines: r.keptLines, bodyTop: plan.bodyTop, floor: plan.floor, continuationStyle };
 }

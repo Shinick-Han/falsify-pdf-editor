@@ -29,12 +29,55 @@ scaled or truncated.
 
 ## What continuation pages are not
 
-- Body only. No header, footer, page number or continuation label is copied
-  or synthesized onto them. Original page numbers stay on their source pages
-  and are not renumbered.
+- Not a free re-layout of headers/footers. Their edge text is copied in
+  source style only (see "Continuation edge style" below); no continuation
+  label is synthesized. Original page numbers stay on their source pages and
+  are not renumbered.
 - They do not establish invisibility of the edit or complete preservation of
   the original document's layout: the document has more pages than before,
-  and the continuation pages visibly lack running headers/footers.
+  and continuation page numbers carry a visible decimal suffix.
+
+## Continuation edge style (`source-number-suffix`, version 1)
+
+`src/continuation-template.mjs`. Edge objects are the source page's
+top-level objects whose bounds centre lies outside `[floor - 0.5,
+bodyTop + 0.5]`. Each edge text object is re-created on every continuation
+page with the source object's font object, font size, matrix, fill/stroke
+colour, stroke width and render mode. Running text keeps its exact
+per-character positions (`FPDFText_SetPositions` with the source glyph
+origins in text space, so TJ kerning, Tc and Tw survive as absolute
+offsets). A standalone Arabic page number (object text `/^\s*\d+\s*$/`)
+becomes `<source>.<ordinal>` (`10` -> `10.1`, `10.2`, ...) at natural
+advances, shifted so its inked extent keeps the source anchor (centre within
+2pt of the page centre, else right edge in the right half, left edge in the
+left half). Original edge objects are only read.
+
+Fail-closed codes (severity error, no PDF): `continuation_edge_graphics_unsupported`
+(path/image/shading/form in an edge zone), `continuation_edge_text_layout_unsupported`
+(chars off one text-space baseline, missing origin/box),
+`continuation_edge_style_unsupported` (blend mode / soft mask),
+`continuation_page_number_unsupported` (roman, `- 4 -`, `3 of 9`, `Page 3`, ...),
+`continuation_page_number_ambiguous` (different standalone numbers),
+`continuation_page_number_spacing_unsupported` (source digits not at natural
+advances), `continuation_page_number_glyph_missing` (font cannot draw `.` or
+a needed digit: no width or no outline), `continuation_edge_clone_failed`,
+`continuation_edge_clone_mismatch` (FPDFText read-back of a clone differs
+from the source glyphs: characters, origins/boxes within 0.05pt, page-number
+digits moved by one common dx, anchor within 0.1pt, non-degenerate suffix),
+`continuation_edge_snapshot_drift` (edge text changed while the source page
+content was regenerated).
+
+Engine notes: the edge snapshot is taken again after the source page's
+content is generated, because font de-aliasing there may replace edge objects
+and their handles. On each new page the clones are inserted and generated
+first; moved body objects are then inserted between them and the page is
+generated again. One generation with both stream-less clones and moved
+objects (source stream index 0) lets PDFium overwrite the clones' new stream,
+which was reproduced as clones missing after save.
+
+Helper API for independent checks (pure, from a source snapshot):
+`snapshotPageEdges(engine, floor, bodyTop)`, `expectedPageEdges(snapshot,
+ordinal)`, `classifyEdgeText`, `continuationNumberText`, `anchorOf`.
 
 ## Scope (anything else is an explicit `*_unsupported` error)
 
@@ -82,7 +125,10 @@ downstream page contents are never modified.
   `{ sourcePageIndex, outputPageIndex, continuationPageIndices[] }`; entries
   with continuation pages also carry `lineCounts[]` (planned lines per
   continuation page), `keptLines`, and the body band `bodyTop` / `floor`
-  (PDF user-space y).
+  (PDF user-space y), and `continuationStyle: { version: 1, policy:
+  "source-number-suffix", applied: true }`.
+- `continuationStyle: { policy: "source-number-suffix", applied: true,
+  copiedPages }` after a passing self-check when pages were added.
 - `flow[]` per continued source page: `outputPageIndices`, `bodyBand`,
   `expectedText` and `outputParts` as `{ sha256, chars }` (plus `text` only
   with `includeFlowText: true`), `measuredLines` (`{ planned, measured }`,
@@ -111,6 +157,14 @@ downstream page contents are never modified.
 
 ## Known risks
 
+- Edge clones do not carry the source clip path, marked-content (e.g.
+  `/Artifact`) tags or extended graphics state beyond colour alpha; a source
+  header clipped by a page-level clip is copied unclipped.
+- Glyph availability for the suffix is a width + outline check through the
+  font's Unicode mapping; a subset font whose `.notdef`-like outline is
+  reached by that mapping is not distinguished from a real glyph.
+- Single-digit page numbers give no digit pair to confirm natural spacing; a
+  source Tc/Tz on them is not reproduced on the suffix.
 - Objects moved from different source content streams keep their stream
   index (PDFium exposes no setter); on the new page they are written grouped
   by stream. A resulting order change is caught by the ordered text check

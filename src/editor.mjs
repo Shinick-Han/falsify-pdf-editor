@@ -20,6 +20,11 @@ export const LIMITS = Object.freeze({
 export const EDITOR_CAPABILITIES = Object.freeze({
   reflow: true,
   pagination: PAGINATION_CAPABILITY,
+  continuationStyle: Object.freeze({
+    supported: true,
+    policy: "source-number-suffix",
+    scope: "text-only source-style header/footer; standalone Arabic source number plus decimal suffix; originals unchanged",
+  }),
   limits: LIMITS,
 });
 
@@ -340,8 +345,11 @@ export async function editPdf(request, options = {}) {
       }
       if (reflow) {
         let r;
+        // The paginate result is kept so its continuationStyle reaches the
+        // page map even when the quality module does not forward it.
+        let paginated = null;
         const repairOptions = pg.allow
-          ? { paginate: (eng, ctx, grown, info) => paginateOverflow(eng, ctx, grown, { ...info, maxNewPages: pg.max - added }) }
+          ? { paginate: (eng, ctx, grown, info) => (paginated = paginateOverflow(eng, ctx, grown, { ...info, maxNewPages: pg.max - added })) }
           : {};
         try {
           r = quality.repairPageLayout(engine, at, context, touched, repairOptions);
@@ -364,7 +372,8 @@ export async function editPdf(request, options = {}) {
           });
         }
         if (r?.pagination?.added > 0) {
-          continued.set(pageIndex, r.pagination);
+          const style = r.pagination.continuationStyle ?? (paginated?.ok ? paginated.continuationStyle : undefined);
+          continued.set(pageIndex, { ...r.pagination, continuationStyle: style });
           added += r.pagination.added;
         }
       }
@@ -394,6 +403,7 @@ export async function editPdf(request, options = {}) {
     const n = c?.added ?? 0;
     const entry = { sourcePageIndex: s, outputPageIndex: out, continuationPageIndices: Array.from({ length: n }, (_, k) => out + 1 + k) };
     if (c) Object.assign(entry, { lineCounts: [...c.lineCounts], keptLines: c.keptLines, bodyTop: c.bodyTop, floor: c.floor });
+    if (c?.continuationStyle) entry.continuationStyle = { version: c.continuationStyle.version, policy: c.continuationStyle.policy, applied: c.continuationStyle.applied === true };
     sourcePageMap.push(entry);
     out += 1 + n;
   }
@@ -431,6 +441,9 @@ export async function editPdf(request, options = {}) {
   const unapplied = report.edits.filter((r) => r.status !== "applied" && r.status !== "noop");
   if (unapplied.length) throw fail("EDIT_NOT_APPLIED", "Some requested edits were not applied", { ids: unapplied.map((r) => r.id) });
   if (check?.ok !== true) throw fail("SELF_CHECK_FAILED", "Saved-PDF self-check reported failures");
+  if (added > 0 && sourcePageMap.every((m) => !m.continuationPageIndices.length || m.continuationStyle?.applied === true)) {
+    report.pagination.continuationStyle = { policy: "source-number-suffix", applied: true, copiedPages: added };
+  }
   report.ok = true;
   report.status = "self-check-passed";
   return { pdf, report };
