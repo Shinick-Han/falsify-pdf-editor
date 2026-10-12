@@ -1,6 +1,6 @@
 {
   "name": "falsify-pdf-editor",
-  "version": "0.1.0-alpha.2",
+  "version": "0.1.0-alpha.3",
   "private": true,
   "description": "Explicit, all-or-nothing PDF text edits on pinned BentoPDF editcore (experimental)",
   "license": "AGPL-3.0-only",

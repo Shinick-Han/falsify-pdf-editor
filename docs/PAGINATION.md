@@ -120,3 +120,9 @@ downstream page contents are never modified.
   rejects those (`glyphs_off_page`), pagination is not attempted.
 - Same PDFium build for editing and self-check; independent extractors and
   rendering review remain required.
+- Inherited save precision: decimal MediaBox numbers can be serialized at
+  float32 precision. A synthetic A4 fixture changed by about 0.00003 pt;
+  untouched content streams and text were identical, and MuPDF/PDFium pixels
+  matched, but Poppler's raster differed. An isolated page-box restore and
+  reverse-perturb control reproduced/eliminated the effect. No universal
+  byte-exact geometry or cross-renderer pixel-identity claim is made.
