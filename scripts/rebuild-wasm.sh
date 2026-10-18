@@ -28,7 +28,14 @@
 #   link        em++ ESM link -> build/wasm/pdfium.{js,wasm}
 #   snapshot    copy outputs to a new $BUILD_ROOT/out/$SNAPSHOT and, if set,
 #               to CANDIDATE_DIR (new or empty apart from package.json)
+#   provenance  write $BUILD_ROOT/out/$SNAPSHOT/provenance.json for an existing
+#               snapshot that still matches build/wasm: pins, diffs, patches
+#               verified as applied (RECORD_PATCHES="pdfium=/p engine=/p"),
+#               script and tool versions, artifact digests and sizes
 #   inventory   record tool versions, gclient revinfo and license files
+#
+# OUT_NAME (default wasm) selects the GN output directory pdfium-src/out/NAME,
+# so a fresh full compile can run beside an existing one.
 #
 # The output is a new artifact. It is not expected to be byte-identical to the
 # binary committed upstream and must be tested before use.
@@ -48,7 +55,9 @@ DEPOT_TOOLS_URL=${DEPOT_TOOLS_URL:-https://chromium.googlesource.com/chromium/to
 JOBS=${JOBS:-8}
 SNAPSHOT=${SNAPSHOT:-build}
 CANDIDATE_DIR=${CANDIDATE_DIR:-}
+OUT_NAME=${OUT_NAME:-wasm}
 MARKER_NAME=.editor-wasm-build-root
+SCRIPT_PATH=$(realpath -e -- "$0")
 
 # guard_build_root: canonical, real, user-owned, not a system or home
 # directory, and carrying (or explicitly adopting) the ownership marker.
@@ -88,13 +97,14 @@ real_dir() {
 }
 
 guard_build_root
+[[ $OUT_NAME =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "OUT_NAME must be a simple name"
 TOOLS=$BUILD_ROOT/tools
 EMSDK_DIR=$TOOLS/emsdk
 DEPOT_TOOLS=$TOOLS/depot_tools
 ENGINE=$BUILD_ROOT/src/engine
 PDFIUM=$ENGINE/packages/pdfium
 SRC=$PDFIUM/pdfium-src
-OUT=$SRC/out/wasm
+OUT=$SRC/out/$OUT_NAME
 WS=$PDFIUM/build/wasm
 # Files the exports and link stages may (over)write in $WS, and nothing else.
 WS_FILES=(all.h ast.json exported-functions.txt exported-runtime-methods.txt
@@ -359,6 +369,93 @@ stage_snapshot() {
   fi
 }
 
+# stage_provenance: describe an existing snapshot from the live build root.
+# Every value is read or recomputed here; nothing is taken on trust from the
+# caller except which extra patch files to check (and they must reverse-apply).
+stage_provenance() {
+  activate_tools
+  [[ $SNAPSHOT =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "SNAPSHOT must be a simple name"
+  local dest=$BUILD_ROOT/out/$SNAPSHOT f
+  [[ -d $dest && ! -L $dest ]] || die "$dest is not an existing snapshot"
+  [[ ! -e $dest/provenance.json ]] || die "$dest/provenance.json already exists"
+  for f in pdfium.js pdfium.wasm exported-functions.txt exported-runtime-methods.txt; do
+    cmp -s "$dest/$f" "$WS/$f" || die "$dest/$f differs from $WS/$f; snapshot is stale"
+  done
+  cmp -s "$dest/libembedpdf.a" "$OUT/obj/libembedpdf.a" || die "$dest/libembedpdf.a differs from $OUT"
+  ( cd "$dest" && sha256sum -c --quiet SHA256SUMS ) || die "SHA256SUMS check failed in $dest"
+  [[ $(git -C "$ENGINE" diff --binary | sha256sum) == "$(sha256sum < "$dest/engine.diff")" ]] ||
+    die "engine tree changed since snapshot"
+  [[ $(git -C "$SRC" diff --binary | sha256sum) == "$(sha256sum < "$dest/pdfium.diff")" ]] ||
+    die "pdfium tree changed since snapshot"
+  # kv KEY VALUE: one tab-separated record; KEY is a slash-separated JSON path.
+  local rec=
+  kv() { rec+=$(printf '%s\t%s' "$1" "${2//$'\t'/ }")$'\n'; }
+  kv schema editor-wasm-build-provenance/1
+  kv created_utc "$(date -u +%FT%TZ)"
+  kv snapshot "$SNAPSHOT"
+  kv build_root "$BUILD_ROOT"
+  kv out_dir "$OUT"
+  kv jobs "$JOBS"
+  kv script/path "$SCRIPT_PATH"
+  kv script/sha256 "$(sha256sum < "$SCRIPT_PATH" | cut -d' ' -f1)"
+  kv engine/url "$(git -C "$ENGINE" remote get-url origin)"
+  kv engine/commit "$(git -C "$ENGINE" rev-parse HEAD)"
+  kv engine/diff_sha256 "$(sha256sum < "$dest/engine.diff" | cut -d' ' -f1)"
+  kv pdfium/url "$(git -C "$SRC" remote get-url origin)"
+  kv pdfium/commit "$(git -C "$SRC" rev-parse HEAD)"
+  kv pdfium/diff_sha256 "$(sha256sum < "$dest/pdfium.diff" | cut -d' ' -f1)"
+  kv pdfium/status_sha256 "$(sha256sum < "$dest/pdfium.status" | cut -d' ' -f1)"
+  local p
+  for p in security-fixes editcore-pdfium brotli-decode; do
+    git -C "$SRC" apply --reverse --check "$PDFIUM/build/patch/$p.patch" >/dev/null 2>&1 ||
+      die "engine build patch $p is not applied"
+    kv "engine_build_patches/$p" "$(sha256sum < "$PDFIUM/build/patch/$p.patch" | cut -d' ' -f1)"
+  done
+  local spec repo repo_dir path i=0
+  for spec in ${RECORD_PATCHES:-}; do
+    repo=${spec%%=*} path=${spec#*=}
+    case $repo in engine) repo_dir=$ENGINE ;; pdfium) repo_dir=$SRC ;;
+      *) die "RECORD_PATCHES entry must be engine=PATH or pdfium=PATH" ;; esac
+    [[ -f $path && ! -L $path ]] || die "not a regular patch file: $path"
+    git -C "$repo_dir" apply --reverse --check "$path" >/dev/null 2>&1 ||
+      die "not applied in $repo: $path"
+    kv "extra_patches/$i/repo" "$repo"
+    kv "extra_patches/$i/name" "${path##*/}"
+    kv "extra_patches/$i/sha256" "$(sha256sum < "$path" | cut -d' ' -f1)"
+    i=$((i + 1))
+  done
+  kv toolchain/emsdk_version "$EMSDK_VERSION"
+  kv toolchain/emsdk_commit "$(git -C "$EMSDK_DIR" rev-parse HEAD)"
+  kv toolchain/emcc "$(emcc --version | head -1)"
+  kv toolchain/clang "$(clang --version | head -1)"
+  kv toolchain/node "$(node --version)"
+  kv toolchain/python3 "$(python3 --version 2>&1)"
+  kv toolchain/depot_tools "$(git -C "$DEPOT_TOOLS" rev-parse HEAD)"
+  kv toolchain/gn "$("$SRC/buildtools/linux64/gn" --version)"
+  kv toolchain/ninja "$("$SRC/third_party/ninja/ninja" --version)"
+  for f in pdfium.js pdfium.wasm libembedpdf.a exported-functions.txt exported-runtime-methods.txt; do
+    kv "artifacts/$f/sha256" "$(sha256sum < "$dest/$f" | cut -d' ' -f1)"
+    kv "artifacts/$f/bytes" "$(stat -c %s -- "$dest/$f")"
+  done
+  kv scope "state of this build root when the snapshot was described; not an independent or clean-room build"
+  printf '%s' "$rec" | python3 -c '
+import json, sys
+doc = {}
+for line in sys.stdin.read().splitlines():
+    key, value = line.split("\t", 1)
+    node, parts = doc, key.split("/")
+    for part in parts[:-1]:
+        node = node.setdefault(part, {})
+    node[parts[-1]] = value
+if "extra_patches" in doc:
+    doc["extra_patches"] = [doc["extra_patches"][k] for k in sorted(doc["extra_patches"], key=int)]
+with open(sys.argv[1], "x", encoding="utf-8") as out:
+    json.dump(doc, out, indent=2)
+    out.write("\n")
+' "$dest/provenance.json"
+  sha256sum "$dest/provenance.json"
+}
+
 stage_inventory() {
   activate_tools
   local inv=$BUILD_ROOT/out/inventory
@@ -388,10 +485,10 @@ stage_inventory() {
   cat "$inv/tools.txt"
 }
 
-[[ $# -gt 0 ]] || { sed -n '2,35p' "$0"; exit 2; }
+[[ $# -gt 0 ]] || { sed -n '2,42p' "$0"; exit 2; }
 for stage in "$@"; do
   case $stage in
-    fetch|toolchain|sync|prepare|patch|configure|lib|exports|link|snapshot|inventory) ;;
+    fetch|toolchain|sync|prepare|patch|configure|lib|exports|link|snapshot|provenance|inventory) ;;
     *) die "unknown stage: $stage" ;;
   esac
   log "stage $stage start"

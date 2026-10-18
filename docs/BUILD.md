@@ -95,6 +95,26 @@ SNAPSHOT=patched CANDIDATE_DIR=/new/empty/dir scripts/rebuild-wasm.sh snapshot
 scripts/rebuild-wasm.sh inventory
 ```
 
+`OUT_NAME` (default `wasm`) selects the GN output directory
+`pdfium-src/out/$OUT_NAME`, so a full compile can be repeated beside an
+existing one without cleaning it (`OUT_NAME=wasm-2 scripts/rebuild-wasm.sh
+configure lib exports link`). The `provenance` stage describes an existing
+snapshot that still matches the live tree:
+
+```sh
+SNAPSHOT=patched RECORD_PATCHES="pdfium=$PWD/patches/pdfium-stream-order.patch" \
+  scripts/rebuild-wasm.sh provenance
+```
+
+It refuses a stale snapshot (outputs, static library or source diffs changed
+since `snapshot`), refuses a listed patch that does not reverse-apply in its
+repository, and writes `out/$SNAPSHOT/provenance.json` once
+(`editor-wasm-build-provenance/1`): engine/PDFium URLs, commits and diff
+digests, the engine's three build patches, extra patches, the script's own
+SHA-256, toolchain versions and the SHA-256 and size of each artifact. It
+describes one build root at one moment; it is not an independent or
+clean-room build and not a signed attestation.
+
 What it pins and isolates:
 
 | Input | Pin |
