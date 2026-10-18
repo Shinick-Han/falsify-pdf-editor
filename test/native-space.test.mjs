@@ -7,6 +7,7 @@
 // source realises interword spaces as positioning folded into the advance of
 // the glyph before the space. glyphAdvance, advanceOf and srcAdvMatchesFont
 // (identity branch only) are transcribed from layout.cpp, not extracted.
+// emitOverride stands in for an edited piece resolved to another font.
 // Real text-object emission, fonts and line breaking need the rebuilt WASM.
 // Skipped when no host C++ compiler (g++, `wsl.exe -e g++` or MSVC) is found.
 import assert from "node:assert/strict";
@@ -71,7 +72,8 @@ static std::vector<float> layout_${name}(std::vector<ParaRun> layoutRuns, float 
   p.fmt.word_spacing = ws;
   const float charSpacing = 0.0f;
   std::vector<ResolvedRun> resolved;
-  for (auto& r : layoutRuns) resolved.push_back({r.originalFont, r.style.size, r.style.hScale, false});
+  for (auto& r : layoutRuns)
+    resolved.push_back({!r.textUnchanged && emitOverride ? emitOverride : r.originalFont, r.style.size, r.style.hScale, false});
   auto glyphAdvance = [](FPDF_FONT font, uint32_t cp, float size) {
     float w = 0;
     if (font && FPDFFont_GetGlyphWidth(font, cp, size, &w) && w > 0) return w;
@@ -143,13 +145,14 @@ struct ResolvedRun { FPDF_FONT font; float emitSize; float hScale; bool complex;
 struct Fmt { float word_spacing = 0; };
 struct Para { Fmt fmt; };
 struct Token { float width = 0; };
+static FPDF_FONT emitOverride = nullptr;
 
 namespace post {
 ${slice(session.post, "std::vector<float> sliceSrcAdvAt(")}
 ${slice(session.post, "void appendEditedRun(")}
 ${slice(layout.post, "struct SpaceSampleRun {")}
 ${slice(layout.post, "std::vector<float> sourceNaturalSpaces(")}
-${LAYOUT("post", slice(layout.post, "std::vector<float> naturalSpace;", "naturalSpace = sourceNaturalSpaces(samples);") + "\n  }",
+${LAYOUT("post", slice(layout.post, "std::vector<float> naturalSpace;", "naturalSpace[ri] = -1.0f;") + "\n    }\n  }",
   slice(layout.post, "const bool naturalOk", "u' ');"))}
 }
 namespace pre {
@@ -158,19 +161,23 @@ ${slice(session.pre, "void appendEditedRun(")}
 ${LAYOUT("pre", "", slice(layout.pre, "t.width = (ov >= 0", "u' ');"))}
 }
 
-static FakeFont tex;
+// tex has no space glyph; texsp is tex with one; texalt is a second font with
+// tex's metrics.
+static FakeFont tex, texsp, texalt;
 static const float SIZE = 9.963f;
 static const float GAP = 0.25f * SIZE;
+static const float JUSTIFIED = 0.4f * SIZE;
 static float own(char16_t c) { float w = 0; FPDFFont_GetGlyphWidth(&tex, c, SIZE, &w); return w; }
 static std::u16string u16(const std::string& s) { return std::u16string(s.begin(), s.end()); }
 // Source line as a TeX subset font shows it: no space glyph, the interword gap
-// folded into the glyph before each space (space advance 0), "ft" kerned.
-static ParaRun source(const std::string& s) {
-  ParaRun r; r.text = u16(s); r.style.size = SIZE; r.originalFont = &tex; r.textUnchanged = true;
+// folded into the glyph before each space (space advance 0), "ft" kerned. With
+// font texsp each space instead carries its own (justified) source advance.
+static ParaRun source(const std::string& s, FakeFont* font = &tex) {
+  ParaRun r; r.text = u16(s); r.style.size = SIZE; r.originalFont = font; r.textUnchanged = true;
   for (size_t i = 0; i < s.size(); i++) {
-    if (s[i] == ' ') { r.srcAdv.push_back(0.0f); continue; }
+    if (s[i] == ' ') { r.srcAdv.push_back(font == &texsp ? JUSTIFIED : 0.0f); continue; }
     float a = own(s[i]);
-    if (i + 1 < s.size() && s[i + 1] == ' ') a += GAP;
+    if (font != &texsp && i + 1 < s.size() && s[i + 1] == ' ') a += GAP;
     if (s[i] == 'f' && i + 1 < s.size() && s[i + 1] == 't') a -= 0.2f;
     r.srcAdv.push_back(a);
   }
@@ -197,18 +204,23 @@ static std::vector<float> gaps(const std::string& s, const std::vector<float>& a
 int main() {
   for (char c = 'a'; c <= 'z'; c++) tex.w[static_cast<uint32_t>(c)] = 400.0f + 10.0f * (c - 'a');
   tex.w[u'.'] = 250.0f; tex.w[u'R'] = 667.0f; tex.w[u'F'] = 556.0f;
+  texalt = texsp = tex; texsp.w[u' '] = 333.0f;
   std::string line;
   while (std::getline(std::cin, line)) {
     if (!line.empty() && line.back() == '\\r') line.pop_back();
     if (line.empty()) continue;
     std::istringstream in(line);
     std::string cmd; in >> cmd;
-    if (cmd == "edit") {
+    if (cmd == "edit" || cmd == "editx") {
+      // editx space: source and edit in texsp; editx swap: the edited piece
+      // resolves to texalt.
+      std::string mode; if (cmd == "editx") in >> mode;
       float ws; in >> ws; in.get();
       std::string rest; std::getline(in, rest);
       const size_t bar = rest.find('|');
       const std::string before = rest.substr(0, bar), after = rest.substr(bar + 1);
-      const ParaRun src = source(before);
+      const ParaRun src = source(before, mode == "space" ? &texsp : &tex);
+      emitOverride = mode == "swap" ? &texalt : nullptr;
       ParaRun r = src; r.text = u16(after); r.textUnchanged = false; r.srcAdv.clear();
       std::vector<ParaRun> a, b;
       pre::appendEditedRun(a, r, src);
@@ -296,6 +308,8 @@ function run(lines) {
 const SIZE = 9.963;
 const NATURAL = 0.25 * SIZE; // the stand-in source line's interword gap
 const FALLBACK = 0.5 * SIZE; // glyphAdvance with no space glyph
+const SPACE_GLYPH = 0.333 * SIZE; // texsp's own space width
+const JUSTIFIED = 0.4 * SIZE; // texsp source space advance
 const close = (got, want, what) =>
   assert.ok(got.length === want.length && got.every((g, i) => Math.abs(g - want[i]) < 0.01),
     `${what}: got ${JSON.stringify(got)}, want ${JSON.stringify(want.map((w) => +w.toFixed(3)))}`);
@@ -379,4 +393,25 @@ test("no or disagreeing source evidence: no assumed space width", (t) => {
   assert.ok(Math.abs(agree - 2.5) < 0.01, `agree ${agree}`);
   assert.equal(disagree, -1);
   assert.equal(tiny, -1);
+});
+
+test("a font with a working space glyph keeps its measured width over the source gap", (t) => {
+  const out = run([`editx space 0 ${LINE}|the distribution shift that this improvement induces.`,
+    `editx space 0 ${LINE}|the distribution shift that  this improvement   induces.`]);
+  if (!out) return t.skip("no host C++ compiler");
+  for (const { pre, post } of out) assert.deepEqual(post, pre);
+  // Kept spaces keep their source (justified) advance; the cut boundary space
+  // and edited spaces are measured from the font, as before the patch.
+  close(out[0].post.gaps, [JUSTIFIED, JUSTIFIED].concat(Array(4).fill(SPACE_GLYPH)), "space glyph");
+  close(out[1].post.gaps, [JUSTIFIED, JUSTIFIED].concat([1, 2, 1, 3].map((k) => k * SPACE_GLYPH)), "space glyph multi");
+});
+
+test("an edited piece resolved to another font does not borrow the source font's gap", (t) => {
+  const out = run([`editx swap 0 ${LINE}|the distribution shift that this improvement induces.`]);
+  if (!out) return t.skip("no host C++ compiler");
+  const [{ pre, post }] = out;
+  // Kept prefix: natural gaps, its folded boundary space kept at 0. Edited
+  // piece in texalt: the existing font measurement (0.5 em fallback).
+  close(post.gaps, [NATURAL, NATURAL, NATURAL, FALLBACK, FALLBACK, FALLBACK], "swapped font");
+  close(pre.gaps, [NATURAL, NATURAL, NATURAL + FALLBACK, FALLBACK, FALLBACK, FALLBACK], "unpatched");
 });

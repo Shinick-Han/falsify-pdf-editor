@@ -1,5 +1,5 @@
 diff --git a/packages/pdfium/build/code/editcore/layout.cpp b/packages/pdfium/build/code/editcore/layout.cpp
-index 2870d732..42693a5b 100644
+index 2870d732..31e9b900 100644
 --- a/packages/pdfium/build/code/editcore/layout.cpp
 +++ b/packages/pdfium/build/code/editcore/layout.cpp
 @@ -54,100 +54,152 @@ void pinLiftedTextPositions(FPDF_PAGEOBJECT obj) {
@@ -155,7 +155,7 @@ index 2870d732..42693a5b 100644
      return name;
  }
  
-@@ -1393,200 +1445,233 @@ bool layoutParagraph(Session& s, FPDF_PAGE page, Paragraph& p, bool autoWiden,
+@@ -1393,200 +1445,246 @@ bool layoutParagraph(Session& s, FPDF_PAGE page, Paragraph& p, bool autoWiden,
          [&](const Token& t,
              const std::function<void(int, const std::u16string&)>& fn) {
              int curRi = -1;
@@ -218,7 +218,7 @@ index 2870d732..42693a5b 100644
 +            sr.hScale = lr.style.hScale;
 +            if (!srcAdvOk || resolved[ri].complex ||
 +                lr.srcAdv.size() != lr.text.size() ||
-+                !srcAdvMatchesFont(static_cast<int>(ri)))
++                resolved[ri].font != lr.originalFont)
 +                continue;
 +            sr.text = &lr.text;
 +            sr.adv = &lr.srcAdv;
@@ -233,6 +233,19 @@ index 2870d732..42693a5b 100644
 +            };
 +        }
 +        naturalSpace = sourceNaturalSpaces(samples);
++        // The source gap stands in only for a space the emitted font cannot
++        // measure, and only when the piece emits in its source font: a known
++        // space width (the source gap may be justified) or a substituted font
++        // keeps the existing measurement.
++        for (size_t ri = 0; ri < layoutRuns.size(); ri++) {
++            float w = 0;
++            if (naturalSpace[ri] > 0.0f &&
++                (resolved[ri].font != layoutRuns[ri].originalFont ||
++                 (FPDFFont_GetGlyphWidth(resolved[ri].font, u' ',
++                                         resolved[ri].emitSize, &w) &&
++                  std::isfinite(w) && w > 0.0f)))
++                naturalSpace[ri] = -1.0f;
++        }
 +    }
 +
      bool anyEdited = false;
@@ -391,10 +404,10 @@ index 2870d732..42693a5b 100644
                  newW = std::min(newW, pageW - MARGIN - p.x);
                  if (newW > p.width) p.width = newW;
 diff --git a/packages/pdfium/build/code/editcore/session.cpp b/packages/pdfium/build/code/editcore/session.cpp
-index 3a26622a..76b9b46f 100644
+index 3a26622a..714e9d95 100644
 --- a/packages/pdfium/build/code/editcore/session.cpp
 +++ b/packages/pdfium/build/code/editcore/session.cpp
-@@ -1,86 +1,98 @@
+@@ -1,86 +1,99 @@
  #include <cstdlib>
  
  #include <ctime>
@@ -432,10 +445,11 @@ index 3a26622a..76b9b46f 100644
                             src.srcAdv.begin() + static_cast<long>(at + len));
 -    if (at + len < src.text.size()) out.back() = -1.0f;
 +    // A glyph cut before its source neighbour loses the kerning to it. A cut
-+    // space keeps its source advance: the interword gap does not depend on
-+    // the next word, and a space at 0 has its gap folded into the kept glyph
-+    // before it.
-+    if (at + len < src.text.size() && src.text[at + len - 1] != u' ')
++    // space at 0 keeps it: its gap is folded into the kept glyph before it
++    // and does not depend on the next word.
++    if (at + len < src.text.size() &&
++        !(src.text[at + len - 1] == u' ' && out.back() >= 0.0f &&
++          out.back() < 0.01f))
 +        out.back() = -1.0f;
 +    // Leading spaces whose gap was folded into the cut-off glyph before them
 +    // carry no width of their own; leave them for layout to measure.
