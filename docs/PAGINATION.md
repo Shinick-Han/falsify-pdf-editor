@@ -5,12 +5,20 @@ extraction/rendering QA is still required for every output.
 
 ## What it does
 
-When a reflowed edit grows past the page's body floor (the top of the
-bottom edge content, e.g. the page number, + 2pt), the edited paragraph and
-the body text that follows it on the same page form one flow:
+When a reflowed edit grows past the page's body floor, the edited paragraph
+and the body text that follows it on the same page form one flow. The floor
+is the top of the bottom edge content (e.g. the page number) + 2pt, raised
+to the bottom 10% of the page's content extent (the band the saved-PDF
+check reads as footer content), but never above the lowest source body
+text:
 
 1. The edited paragraph is re-laid out at its source column width and line
-   pitch (existing repair).
+   pitch (existing repair). A surgical commit that stays inside its column
+   is kept as committed; if it wrapped onto more lines, its growth is the
+   drop of its last baseline (text-matrix origin), so followers move by
+   whole source lines and are pushed (or continued) like a resized edit.
+   A re-layout whose glyph ink still ends past the column is narrowed once
+   by the overshoot (unrotated, unoffset pages only).
 2. The flow is grouped into actual line objects. Each following line is
    shifted down by the growth above it (as the cascade does).
 3. Lines are assigned in order to the source page while they stay above the
@@ -177,9 +185,18 @@ downstream page contents are never modified.
   index (PDFium exposes no setter); on the new page they are written grouped
   by stream. A resulting order change is caught by the ordered text check
   and fails the edit; it is not repaired.
-- Edited paragraphs that the engine commits "surgically" without resize can
-  still overflow off-page in some uniform-line layouts; the self-check
-  rejects those (`glyphs_off_page`), pagination is not attempted.
+- Surgical growth is measured from text-matrix baselines; without
+  FPDFPageObj_GetMatrix, or for rotated/skewed text objects, it falls back to
+  the font-box bottom versus glyph-bounds bottom, which can differ by a
+  descender. Before 2026-10-19 surgical growth was ignored entirely, so the
+  following paragraphs were overlapped (QA finding F2).
+- Header/footer detection is heuristic: a paragraph is edge content only if
+  it is at most 60 characters, 12 words and 2 lines and lies fully inside
+  the top/bottom 10% of the page. A longer running header is body text: it
+  is not copied onto continuation pages and the body band starts at it.
+- The self-check's edge glyphs on an edited page are whole lines that lie
+  fully inside that 10% band; a body line straddling the band boundary is
+  body, not a partially moved header.
 - Same PDFium build for editing and self-check; independent extractors and
   rendering review remain required.
 - Inherited save precision: decimal MediaBox numbers can be serialized at

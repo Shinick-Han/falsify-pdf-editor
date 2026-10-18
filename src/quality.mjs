@@ -62,11 +62,13 @@ function hOverlap(a, b) {
 // Header/footer classification from the page itself. Only short paragraphs
 // fully inside the top/bottom band are edge content; numeric ones are
 // treated as page numbers, the rest as uncertain running headers/footers.
-// Both are fixed: repair never moves them.
+// Both are fixed: repair never moves them. "Short" is at most 60 characters
+// on at most two lines; the word cap only excludes long word lists (a
+// running header such as "Title - subtitle - section" easily has 9 words).
 function classify(p, pageH, edgeBottomY) {
   if (!p.box) return "unknown";
   const text = normStr(paraText(p));
-  const short = text.length <= 60 && text.split(" ").length <= 8 && (p.lines?.length || 1) <= 2;
+  const short = text.length <= 60 && text.split(" ").length <= 12 && (p.lines?.length || 1) <= 2;
   const inTop = bottomOf(p.box) >= edgeBottomY + pageH * (1 - EDGE_BAND);
   const inBottom = p.box.top <= edgeBottomY + pageH * EDGE_BAND;
   if (!short || !(inTop || inBottom)) return "body";
@@ -112,6 +114,37 @@ function columnOf(ctx, box) {
     right = Math.max(right, q.box.x + q.box.w);
   }
   return { left: box.x, right };
+}
+
+// True when page model coordinates are plain user space: no /Rotate and an
+// identity page transform (no crop/media offset).
+function uprightPage(engine) {
+  const M = engine.M;
+  if (typeof M._FPDFPage_GetRotation === "function" && M._FPDFPage_GetRotation(engine.page) !== 0) return false;
+  const t = engine.pageT || [1, 0, 0, 1, 0, 0];
+  return [1, 0, 0, 1, 0, 0].every((v, i) => Math.abs(t[i] - v) <= 1e-4);
+}
+
+// Lowest baseline (text-matrix origin) of a paragraph's current objects, or
+// null when any of them is not an unrotated, unskewed text object. The
+// model's source baselines are origins too, so growth measured this way is
+// independent of ascenders/descenders on the first and last lines.
+function lastBaseline(engine, handles) {
+  const M = engine.M;
+  if (!handles.length || typeof M._FPDFPageObj_GetMatrix !== "function") return null;
+  const p = M._malloc(24);
+  try {
+    let y = Infinity;
+    for (const h of handles) {
+      if (M._FPDFPageObj_GetType(h) !== OBJ_TEXT || !M._FPDFPageObj_GetMatrix(h, p)) return null;
+      const [a, b, c, d, e, f] = [0, 1, 2, 3, 4, 5].map((k) => M.HEAPF32[(p >> 2) + k]);
+      if (Math.abs(b) > 1e-4 || Math.abs(c) > 1e-4 || !(a > 0) || !(d > 0)) return null;
+      y = Math.min(y, typeof engine.toModel === "function" ? engine.toModel(e, f).y : f);
+    }
+    return Number.isFinite(y) ? y : null;
+  } finally {
+    M._free(p);
+  }
 }
 
 // Source line pitch: from the paragraph's own lines when it had several,
@@ -190,7 +223,8 @@ export function repairPageLayout(engine, pageIndex, context, touched, options = 
       warnings.push({ code: "edited_edge_paragraph", id: t.id, role: info.role, severity: "warning" });
       continue;
     }
-    const cur = unionBounds(engine, (engine.paragraphObjects(t.id) || []).map((h) => h >>> 0));
+    const handles = (engine.paragraphObjects(t.id) || []).map((h) => h >>> 0);
+    const cur = unionBounds(engine, handles);
     if (!cur) {
       warnings.push({ code: "paragraph_objects_unavailable", id: t.id, severity: "error" });
       continue;
@@ -198,18 +232,45 @@ export function repairPageLayout(engine, pageIndex, context, touched, options = 
     const col = columnOf(context, t.sourceBox);
     const widened = cur.x + cur.w > col.right + TOL || cur.x < t.sourceBox.x - TOL || cur.x + cur.w > context.pageW;
     if (!widened) {
-      // Surgical result stays inside its source column: keep it untouched.
+      // Surgical result stays inside its source column: keep it untouched,
+      // but a surgical commit may still wrap onto more lines, and that
+      // vertical growth must push (or paginate) the body below it. Growth
+      // is the drop of the last baseline; the source box is a font-metric
+      // line box and the current bounds are glyph-tight, so comparing their
+      // bottoms would mix two measures.
       rec.action = "kept_surgical";
+      const src = (t.sourceLines || []).map((l) => l?.y).filter(Number.isFinite);
+      const base = src.length ? lastBaseline(engine, handles) : null;
+      const delta = base !== null ? Math.min(...src) - base : bottomOf(t.sourceBox) - bottomOf(cur);
+      if (delta > 0.5) {
+        rec.grown = { by: +delta.toFixed(2), from: base !== null ? "baselines" : "bounds" };
+        grown.push({ id: t.id, box: t.sourceBox, delta });
+      }
       continue;
     }
     const colW = col.right - t.sourceBox.x;
-    const width = t.sourceBox.w >= 0.85 * colW ? t.sourceBox.w : colW;
-    const rz = engine.resizeParagraph(t.id, width);
+    let width = t.sourceBox.w >= 0.85 * colW ? t.sourceBox.w : colW;
+    let rz = engine.resizeParagraph(t.id, width);
     if (!rz || !rz.box) {
       warnings.push({ code: "resize_failed", id: t.id, severity: "error" });
       continue;
     }
     rec.action = "resized";
+    // The engine wraps by its own advance measure, so a line's glyph ink
+    // can still end past the column. Narrow once by the measured overshoot,
+    // only on pages whose model space is the unrotated user space.
+    const ink = uprightPage(engine) ? unionBounds(engine, (engine.paragraphObjects(t.id) || []).map((h) => h >>> 0)) : null;
+    const over = ink ? ink.x + ink.w - (col.right + TOL) : 0;
+    if (over > 0) {
+      const narrower = engine.resizeParagraph(t.id, width - over - TOL);
+      if (!narrower || !narrower.box) {
+        warnings.push({ code: "resize_failed", id: t.id, severity: "error" });
+        continue;
+      }
+      rz = narrower;
+      width -= over + TOL;
+      rec.narrowed = +(over + TOL).toFixed(2);
+    }
     rec.width = +width.toFixed(2);
     rec.lines = rz.lines?.length || 0;
     let bottom = bottomOf(rz.box);
@@ -256,10 +317,18 @@ export function repairPageLayout(engine, pageIndex, context, touched, options = 
 // shift would push body text into the footer zone, nothing is moved and the
 // overflow is reported as pagination_unsupported, or, when the caller can
 // paginate, returned as { floor } for the continuation-page flow.
+//
+// The footer zone is the edge paragraphs' top plus 2, raised to the bottom
+// EDGE_BAND of the page's content extent: the saved-PDF check reads whole
+// lines inside that band as header/footer content, so body text is never
+// moved into it unless the source body already reached lower.
 function cascade(engine, ctx, grown, touchedIds, repairs, warnings, allowOverflow = false) {
   const edgeTops = ctx.paras.filter((q) => q.box && q.role !== "body" && q.box.top < ctx.pageH / 2).map((q) => q.box.top);
   const bodyBottoms = ctx.paras.filter((q) => q.box && q.role === "body").map((q) => bottomOf(q.box));
-  const floor = edgeTops.length ? Math.max(...edgeTops) + 2 : Math.min(...bodyBottoms, Infinity);
+  const pageBottom = Math.min(...ctx.paras.filter((q) => q.box).map((q) => bottomOf(q.box)));
+  const floor = edgeTops.length
+    ? Math.max(Math.max(...edgeTops) + 2, Math.min(pageBottom + EDGE_BAND * ctx.pageH, ...bodyBottoms))
+    : Math.min(...bodyBottoms, Infinity);
   const plan = new Map();
   for (const g of grown) {
     for (const q of ctx.paras) {
@@ -527,15 +596,22 @@ function overlaps(g, adjacentKerning = false) {
   return count;
 }
 
-function edgeGlyphs(g) {
+// Header/footer glyphs of a page: whole text lines whose every glyph centre
+// lies in the top or bottom band of the page's glyph extent. A line that
+// straddles a band boundary is body text (typically the first or last body
+// line) and is never split into an "edge" part and a body part.
+export function edgeGlyphs(g) {
   if (!g.glyphs.length) return [];
   const lo = Math.min(...g.glyphs.map((c) => c.b));
   const hi = Math.max(...g.glyphs.map((c) => c.t));
   const band = EDGE_BAND * g.H;
-  return g.glyphs.filter((c) => {
-    const cy = (c.b + c.t) / 2;
-    return cy <= lo + band || cy >= hi - band;
-  });
+  const inBottom = (c) => (c.b + c.t) / 2 <= lo + band;
+  const inTop = (c) => (c.b + c.t) / 2 >= hi - band;
+  const keep = new Set();
+  for (const line of glyphLines(g.glyphs)) {
+    if (line.every(inBottom) || line.every(inTop)) for (const c of line) keep.add(c);
+  }
+  return g.glyphs.filter((c) => keep.has(c));
 }
 
 function extents(g) {
@@ -809,21 +885,28 @@ function checkContinuationEdges(s, es, g, edge, ordinal, pageIndex, outputPageIn
   return res;
 }
 
-// Measured text lines: glyphs grouped by vertical-centre membership.
-export function countGlyphLines(glyphs) {
+// Text lines: glyphs grouped by vertical-centre membership, top first.
+function glyphLines(glyphs) {
   const sorted = [...glyphs].sort((a, b) => b.t - a.t);
-  let n = 0, top = 0, bottom = 0;
+  const lines = [];
+  let top = 0, bottom = 0;
   for (const c of sorted) {
     const cy = (c.b + c.t) / 2;
-    if (n && cy <= top && cy >= bottom) {
+    if (lines.length && cy <= top && cy >= bottom) {
       bottom = Math.min(bottom, c.b);
+      lines[lines.length - 1].push(c);
       continue;
     }
-    n++;
+    lines.push([c]);
     top = c.t;
     bottom = c.b;
   }
-  return n;
+  return lines;
+}
+
+// Measured text lines: glyphs grouped by vertical-centre membership.
+export function countGlyphLines(glyphs) {
+  return glyphLines(glyphs).length;
 }
 
 // Joins page parts in order. A part ending in "-" whose expected text has a
