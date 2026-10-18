@@ -7,6 +7,7 @@
 // All pages are planned against unchanged snapshots before any commit.
 import { loadRuntime } from "./runtime.mjs";
 import { PAGINATION_CAPABILITY, PAGINATION_LIMITS, paginateOverflow } from "./pagination.mjs";
+import { LineRetentionError, commitRetainingLines, planInlineChange, sourceLinePlan } from "./inline-preservation.mjs";
 
 export const LIMITS = Object.freeze({
   maxFileBytes: 64 * 1024 * 1024,
@@ -124,13 +125,14 @@ function findAll(norm, needle) {
   return hits;
 }
 
-export function rebuildRuns(para, del, inserts) {
+// breaks: optional "ri:o" keys of source whitespace written as hard breaks.
+export function rebuildRuns(para, del, inserts, breaks = null) {
   const out = [];
   para.runs.forEach((r, ri) => {
     let t = "";
     for (let o = 0; o <= r.text.length; o++) {
       for (const ins of inserts) if (ins.ri === ri && ins.o === o) t += ins.text;
-      if (o < r.text.length && !del.has(ri + ":" + o)) t += r.text[o];
+      if (o < r.text.length && !del.has(ri + ":" + o)) t += breaks?.has(ri + ":" + o) ? "\n" : r.text[o];
     }
     out.push({ ...r, text: t, rgba: r.rgba >>> 0, sourceIndex: ri });
   });
@@ -139,6 +141,9 @@ export function rebuildRuns(para, del, inserts) {
 }
 
 // Plans all edits of one page against an unchanged paragraph snapshot.
+// Only the changed tokens inside each match are mutated, so unchanged
+// tokens keep their own run style and a replacement inherits the style of
+// what it replaces (AMBIGUOUS_STYLE when that cannot be justified).
 // Returns { failures, plans, perPara }; failures carry no document text.
 export function planPageEdits(paras, edits) {
   const chars = pageIndexMap(paras);
@@ -169,24 +174,27 @@ export function planPageEdits(paras, edits) {
       continue;
     }
     const lastPi = touched[touched.length - 1];
-    plans.push({
-      edit: e,
-      span,
-      touched,
-      insertAt: span.find((c) => c.pi === lastPi),
-      noop: normalizeText(e.after) === needle,
-    });
+    const noop = normalizeText(e.after) === needle;
+    const change = noop ? null : planInlineChange(paras, chars, map, hits[0], needle, e.after);
+    if (change?.failure) {
+      failures.push({ id: e.id, pageIndex: e.pageIndex, code: change.failure });
+      continue;
+    }
+    plans.push({ edit: e, span, touched, insertAt: span.find((c) => c.pi === lastPi), noop, change, start: a });
   }
   // Paragraph mutations, built only from accepted, non-noop plans.
   const perPara = new Map();
+  const entry = (pi) => {
+    if (!perPara.has(pi)) perPara.set(pi, { del: new Set(), inserts: [] });
+    return perPara.get(pi);
+  };
   for (const p of plans) {
     if (p.noop) continue;
-    for (const c of p.span) {
-      if (!perPara.has(c.pi)) perPara.set(c.pi, { del: new Set(), inserts: [] });
-      perPara.get(c.pi).del.add(c.ri + ":" + c.o);
-    }
-    perPara.get(p.insertAt.pi).inserts.push({ ri: p.insertAt.ri, o: p.insertAt.o, text: p.edit.after });
+    for (const c of p.change.del) entry(c.pi).del.add(c.ri + ":" + c.o);
+    p.change.inserts.forEach((ins, k) => entry(ins.pi).inserts.push({ ri: ins.ri, o: ins.o, text: ins.text, start: p.start, k }));
   }
+  // Inserts sharing a position keep the page order of their edits.
+  for (const v of perPara.values()) v.inserts.sort((x, y) => x.start - y.start || x.k - y.k);
   return { failures, plans, perPara };
 }
 
@@ -309,7 +317,10 @@ export async function editPdf(request, options = {}) {
     }
     if (failures.length) {
       for (const f of failures) Object.assign(editReport.get(f.id), { status: "rejected", code: f.code, hits: f.hits });
-      throw fail("MATCH_FAILED", `${failures.length} edit(s) could not be matched exactly once`, { failures });
+      if (failures.every((f) => f.code === "AMBIGUOUS_STYLE")) {
+        throw fail("STYLE_AMBIGUOUS", `${failures.length} edit(s) replace text of several styles with no justified style mapping`, { failures });
+      }
+      throw fail("MATCH_FAILED", `${failures.length} edit(s) could not be matched exactly once or planned`, { failures });
     }
 
     // Phase 2: per page, re-verify the snapshot, capture layout, commit, repair.
@@ -326,6 +337,7 @@ export async function editPdf(request, options = {}) {
           status: p.noop ? "noop" : "planned",
           paragraphIndices: [...p.touched],
         });
+        if (p.change?.warning) report.warnings.push({ pageIndex, id: p.edit.id, code: p.change.warning, severity: "warning" });
       }
       if (plan.perPara.size === 0) continue;
       const at = pageIndex + added;
@@ -337,10 +349,26 @@ export async function editPdf(request, options = {}) {
       for (const [pi, { del, inserts }] of [...plan.perPara.entries()].sort((x, y) => x[0] - y[0])) {
         const para = paras[pi];
         const runs = rebuildRuns(para, del, inserts);
+        // Source lines are kept in place when the engine re-lays the
+        // paragraph out for an edit that fits them (see inline-preservation).
+        const linePlan = sourceLinePlan(para, del, inserts);
+        if (linePlan?.breaks) linePlan.lineRuns = rebuildRuns(para, del, inserts, linePlan.breaks);
         mutated = true;
-        const upd = engine.commitParagraph(para.id, runs, para.format);
+        let committed;
+        try {
+          committed = commitRetainingLines(engine, para, runs, linePlan);
+        } catch (err) {
+          if (!(err instanceof LineRetentionError)) throw err;
+          throw fail(err.code === "state_drift" ? "STATE_DRIFT" : "COMMIT_FAILED", "Paragraph state could not be re-verified during a line-retaining commit", { pageIndex, paragraphId: para.id, cause: err.code });
+        }
+        const upd = committed.upd;
         if (!upd) throw fail("COMMIT_FAILED", "Engine rejected a paragraph commit", { pageIndex, paragraphId: para.id });
-        pageReport.paragraphs.push({ index: pi, surgical: !!upd.surgical, sourceLines: para.lines?.length ?? null, committedLines: upd.lines?.length ?? null });
+        const row = { index: pi, surgical: !!upd.surgical, sourceLines: para.lines?.length ?? null, committedLines: upd.lines?.length ?? null };
+        if (committed.lines) row.lineRetention = committed.lines;
+        pageReport.paragraphs.push(row);
+        if (committed.lines?.status === "reflowed" && committed.lines.reason !== "line_count_changed") {
+          report.warnings.push({ pageIndex, code: "source_lines_reflowed", paragraphIndex: pi, reason: committed.lines.reason, severity: "warning" });
+        }
         touched.push({ id: upd.id ?? para.id, sourceBox: para.box, sourceLines: para.lines, sourceFormat: para.format });
       }
       if (reflow) {
