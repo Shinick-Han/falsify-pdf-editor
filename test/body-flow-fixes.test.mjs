@@ -219,6 +219,38 @@ test("a re-layout whose glyph ink overshoots the column is narrowed once", () =>
   assert.ok(right <= 550 + 1, String(right));
 });
 
+test("narrowing is bounded: a correction of exactly a tenth of the width is applied", () => {
+  const { engine, model } = makeEngine();
+  const ctx = capturePageLayout(engine, 0, model);
+  engine.surgical(2, 2, 600);
+  engine.overshoot = 50; // ink overshoot 49 + TOL = 50 = 0.1 * 500
+  const r = repairPageLayout(engine, 0, ctx, touched(model, 2));
+  const rec = r.repairs.find((x) => x.kind === "paragraph");
+  assert.deepEqual(engine.calls.resizes, [[2, 500], [2, 450]]);
+  assert.equal(rec.narrowed, 50);
+  assert.equal(rec.width, 450);
+  assert.ok(!r.warnings.some((w) => w.code === "ink_overshoot_unrepaired"));
+});
+
+test("a large or width-exhausting ink overshoot is not narrowed but reported", () => {
+  // 51 is just past the 10% bound; 600 would ask for a negative width.
+  for (const overshoot of [51, 600]) {
+    const { engine, model } = makeEngine();
+    const ctx = capturePageLayout(engine, 0, model);
+    engine.surgical(2, 2, 600);
+    engine.overshoot = overshoot;
+    const r = repairPageLayout(engine, 0, ctx, touched(model, 2));
+    const rec = r.repairs.find((x) => x.kind === "paragraph");
+    assert.equal(rec.action, "resized");
+    assert.deepEqual(engine.calls.resizes, [[2, 500]], String(overshoot));
+    assert.ok(engine.calls.resizes.every(([, w]) => w > 0));
+    assert.equal(rec.narrowed, undefined);
+    assert.equal(rec.width, 500);
+    const w = r.warnings.find((x) => x.code === "ink_overshoot_unrepaired");
+    assert.deepEqual(w, { code: "ink_overshoot_unrepaired", id: 2, overshoot: overshoot - 1, width: 500, severity: "warning" });
+  }
+});
+
 // Glyphs for edgeGlyphs: { u, l, r, b, t }, one per character.
 const glyphLine = (text, base) => [...text].map((ch, k) => {
   const tall = /[A-Zbdfhklt]/.test(ch);

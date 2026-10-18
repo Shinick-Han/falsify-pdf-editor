@@ -258,18 +258,24 @@ export function repairPageLayout(engine, pageIndex, context, touched, options = 
     rec.action = "resized";
     // The engine wraps by its own advance measure, so a line's glyph ink
     // can still end past the column. Narrow once by the measured overshoot,
-    // only on pages whose model space is the unrotated user space.
+    // only on pages whose model space is the unrotated user space, and only
+    // by a modest correction (at most a tenth of the width, TOL included)
+    // that leaves a positive width. A larger overshoot (an unbreakable token
+    // or an engine anomaly) is reported and left to the saved-PDF check.
     const ink = uprightPage(engine) ? unionBounds(engine, (engine.paragraphObjects(t.id) || []).map((h) => h >>> 0)) : null;
     const over = ink ? ink.x + ink.w - (col.right + TOL) : 0;
-    if (over > 0) {
-      const narrower = engine.resizeParagraph(t.id, width - over - TOL);
+    const fix = over + TOL;
+    if (over > 0 && !(fix <= 0.1 * width && width - fix > 0)) {
+      warnings.push({ code: "ink_overshoot_unrepaired", id: t.id, overshoot: +over.toFixed(2), width: +width.toFixed(2), severity: "warning" });
+    } else if (over > 0) {
+      const narrower = engine.resizeParagraph(t.id, width - fix);
       if (!narrower || !narrower.box) {
         warnings.push({ code: "resize_failed", id: t.id, severity: "error" });
         continue;
       }
       rz = narrower;
-      width -= over + TOL;
-      rec.narrowed = +(over + TOL).toFixed(2);
+      width -= fix;
+      rec.narrowed = +fix.toFixed(2);
     }
     rec.width = +width.toFixed(2);
     rec.lines = rz.lines?.length || 0;
