@@ -18,7 +18,10 @@ text:
    drop of its last baseline (text-matrix origin), so followers move by
    whole source lines and are pushed (or continued) like a resized edit.
    A re-layout whose glyph ink still ends past the column is narrowed once
-   by the overshoot (unrotated, unoffset pages only).
+   by the overshoot (unrotated, unoffset pages only). The correction,
+   including the tolerance, must be at most 10% of the width and leave a
+   positive width; otherwise `ink_overshoot_unrepaired` warns and the
+   saved-PDF column self-check remains responsible for rejecting unsafe ink.
 2. The flow is grouped into actual line objects. Each following line is
    shifted down by the growth above it (as the cascade does).
 3. Lines are assigned in order to the source page while they stay above the
