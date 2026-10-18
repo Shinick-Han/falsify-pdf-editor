@@ -58,6 +58,26 @@ test("insertions inherit matching neighbour style; differing neighbours are ambi
   assert.deepEqual(rebuilt([mixedPara()], { before: "bold words", after: "bold" })[1], ["bold", true]);
 });
 
+test("swapping words of different styles is ambiguous, not mapped by position", () => {
+  const cases = [
+    ["then bold", "bold then"],
+    ["then bold words", "words bold then"],
+    // Repeated word: the regular and the bold "words" stay in place, the swap is refused.
+    ["words then bold words", "words bold then words"],
+  ];
+  for (const [before, after] of cases) {
+    const f = rebuilt([mixedPara()], { before, after });
+    assert.equal(f[0]?.code, "AMBIGUOUS_STYLE", `${before} -> ${after}`);
+  }
+  // A canonically equal Unicode spelling is the same moved word.
+  const p = mixedPara();
+  p.runs = [{ ...REG, text: "Plain café then " }, { ...BOLD, text: "naïve words" }, { ...REG, text: " then plain words." }];
+  assert.equal(rebuilt([p], { before: "café then naïve", after: "nai\u0308ve then café" })[0]?.code, "AMBIGUOUS_STYLE");
+  // Same-style reordering and new words keep their justified styles.
+  assert.deepEqual(rebuilt([mixedPara()], { before: "bold words", after: "words bold" })[1], ["words bold", true]);
+  assert.deepEqual(rebuilt([p], { before: "café then naïve", after: "tea then naïve" }).slice(0, 2), [["Plain tea then ", false], ["naïve words", true]]);
+});
+
 test("whitespace facing a source line break is kept when After uses a plain space", () => {
   const p = mixedPara();
   p.runs = [{ ...REG, text: "end of line\nnext line" }];
@@ -129,6 +149,21 @@ test("commitRetainingLines keeps the plain commit without engine support", () =>
   assert.deepEqual(commitRetainingLines(eng, p, p.runs, { reason: "break_inside_word" }).lines, { status: "reflowed", reason: "break_inside_word" });
 });
 
+test("commitRetainingLines labels an edited-line overflow that keeps the line count", () => {
+  const p = threeLines();
+  const lp = sourceLinePlan(p, new Set(["0:6"]), [{ ri: 0, o: 6, text: "quiz quiz" }]);
+  const fake = (preview, committed) => ({
+    page: 1,
+    M: Object.fromEntries(["_FPDFPage_CountObjects", "_FPDFPage_GetObject", "_FPDFText_LoadPage", "_FPDFText_CountChars", "_FPDFText_GetUnicode", "_FPDFText_GetCharOrigin", "_FPDFText_GetTextObject", "_FPDFText_GetFontSize", "_FPDFText_GetFontInfo", "_FPDFText_ClosePage", "_malloc", "_free"].map((f) => [f, () => 0])),
+    previewParagraph: () => ({ lines: Array(preview).fill({}) }),
+    historyBeginStep() {}, historyEndStep() {}, historyUndo: () => true,
+    paragraphObjects: () => [], objectBounds: () => null, translateObject() {},
+    commitParagraph: (id) => ({ id, surgical: false, lines: Array(committed).fill({}) }),
+  });
+  assert.deepEqual(commitRetainingLines(fake(4, 3), p, p.runs, { ...lp, lineRuns: p.runs }).lines, { status: "reflowed", reason: "edited_line_overflows" });
+  assert.deepEqual(commitRetainingLines(fake(4, 4), p, p.runs, { ...lp, lineRuns: p.runs }).lines, { status: "reflowed", reason: "line_count_changed" });
+});
+
 // ---------- real engine ----------
 
 function pdf(content, fonts) {
@@ -154,7 +189,7 @@ function pdf(content, fonts) {
 // is not what these cases test.
 const EDGES = "BT /F1 8 Tf 72 760 Td (SYNTHETIC TEST PAGE - not a paper) Tj ET BT /F1 8 Tf 72 36 Td (Synthetic page 1) Tj ET ";
 const LINES = ["Alpha beta gamma delta held steady on the bench.", "The red gear and the green bolt rested on the shelf.", "Each toy part was checked once and then set down."];
-const paragraphPdf = () => pdf(EDGES + "BT /F1 11 Tf 15 TL 72 700 Td " + LINES.map((l) => `(${l}) Tj T*`).join(" ") + " ET", { F1: "Helvetica" });
+const paragraphPdf = (lines = LINES) => pdf(EDGES + "BT /F1 11 Tf 15 TL 72 700 Td " + lines.map((l) => `(${l}) Tj T*`).join(" ") + " ET", { F1: "Helvetica" });
 const mixedPdf = () => pdf(EDGES + "BT /F1 11 Tf 15 TL 72 700 Td (The toy widget was placed on the bench before noon.) Tj T* "
   + "(Plain words then ) Tj /F2 11 Tf (bold words) Tj /F1 11 Tf ( then plain words.) Tj T* (The paragraph only gives the editor neighbours.) Tj ET",
 { F1: "Helvetica", F2: "Helvetica-Bold" });
@@ -230,6 +265,16 @@ test("real engine: an edit that needs more lines still reflows without a retenti
   assert.ok(!report.warnings.some((w) => w.code === "source_lines_reflowed"));
 });
 
+test("real engine: an edited line that overflows while the paragraph keeps its line count warns", { skip }, async () => {
+  // A short last line leaves room for the plain re-layout, not for the edited source line.
+  const src = paragraphPdf([LINES[0], LINES[1], "Each toy part was set down."]);
+  const { report } = await run(src, [{ id: "o", pageIndex: 0, before: "gamma", after: "gamma quiz" }]);
+  const row = report.pages[0].paragraphs[0];
+  assert.equal(row.committedLines, 3);
+  assert.deepEqual(row.lineRetention, { status: "reflowed", reason: "edited_line_overflows" });
+  assert.ok(report.warnings.some((w) => w.code === "source_lines_reflowed" && w.reason === "edited_line_overflows"));
+});
+
 test("real engine: failed kept-line proof restores the plain re-layout and warns", { skip }, async () => {
   const src = paragraphPdf();
   // Perturb every translation so the kept-line proof cannot hold.
@@ -265,6 +310,9 @@ test("real engine: cross-run edit keeps the bold run bold (F6)", { skip }, async
 
 test("real engine: ambiguous cross-style edit is refused without output", { skip }, async () => {
   await assert.rejects(run(mixedPdf(), [{ id: "a", pageIndex: 0, before: "then bold words", after: "so dark" }]), (e) => e.code === "STYLE_AMBIGUOUS" && e.report.status === "failed");
+  for (const [before, after] of [["then bold", "bold then"], ["then bold words", "words bold then"]]) {
+    await assert.rejects(run(mixedPdf(), [{ id: "s", pageIndex: 0, before, after }]), (e) => e.code === "STYLE_AMBIGUOUS" && e.report.status === "failed" && !e.pdf, after);
+  }
 });
 
 // Optional: the private QA fixtures (subset.pdf, mixed.pdf) when a folder is given.

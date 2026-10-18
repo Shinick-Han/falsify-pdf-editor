@@ -11,6 +11,7 @@
 const WS = /^\s+$/;
 const tokens = (s) => s.match(/\s+|\S+/g) || [];
 const isWs = (c) => /\s/.test(c.ch);
+const nfc = (t) => t.normalize("NFC");
 const STYLE_KEYS = ["family", "bold", "italic", "size", "rgba", "underline", "strike", "script", "renderMode", "strokeRgba", "strokeWidth", "hScale", "rise"];
 
 export const runStyleKey = (r) => STYLE_KEYS.map((k) => String(k === "rgba" || k === "strokeRgba" ? (r?.[k] ?? 0) >>> 0 : r?.[k] ?? "")).join("|");
@@ -59,6 +60,16 @@ export function planInlineChange(paras, chars, map, hit, needle, after) {
     if (styles.size === 1) return { del, inserts: [place(words[0], text)] };
     // Several styles replaced: map word to word when the token shape agrees.
     if (D.length !== X.length) return { failure: "AMBIGUOUS_STYLE" };
+    // A changed After word that spells a source word of the match in another
+    // style may be that word moved (then bold -> bold then): its position
+    // alone justifies neither style.
+    const sourceStyles = new Map();
+    for (const b of bt) {
+      if (WS.test(b.t)) continue;
+      const set = sourceStyles.get(nfc(b.t)) ?? new Set();
+      for (const c of rawOf(b)) if (c.pi >= 0) set.add(style(c));
+      sourceStyles.set(nfc(b.t), set);
+    }
     const keep = new Set();
     const inserts = [];
     for (let i = 0; i < D.length; i++) {
@@ -71,8 +82,12 @@ export function planInlineChange(paras, chars, map, hit, needle, after) {
       }
       const w = rawOf(d).filter((c) => c.pi >= 0);
       if (new Set(w.map(style)).size !== 1) return { failure: "AMBIGUOUS_STYLE" };
-      if (x !== d.t) inserts.push(place(w[0], x));
-      else for (const c of w) keep.add(c);
+      if (x === d.t) {
+        for (const c of w) keep.add(c);
+        continue;
+      }
+      if ([...(sourceStyles.get(nfc(x)) ?? [])].some((k) => k !== style(w[0]))) return { failure: "AMBIGUOUS_STYLE" };
+      inserts.push(place(w[0], x));
     }
     return { del: del.filter((c) => !keep.has(c)), inserts };
   }
@@ -252,6 +267,9 @@ export class LineRetentionError extends Error {
  * not hold, the plain engine re-layout is restored and reported.
  * Returns { upd, lines }: lines is null (nothing to report) or
  * { status: "surgical" | "retained" | "reflowed", reason?, ... }.
+ * A reflow keeping the source line count is never reported as
+ * line_count_changed: when the edited line alone overflows its source line,
+ * the reason is edited_line_overflows.
  * Throws LineRetentionError when the undone state cannot be re-verified.
  */
 export function commitRetainingLines(engine, para, runs, linePlan) {
@@ -281,13 +299,13 @@ export function commitRetainingLines(engine, para, runs, linePlan) {
   const before = lineGlyphs(engine, engine.paragraphObjects(para.id) || [], source);
   const upd = step(para.id, runs);
   if (!upd || upd.surgical) return { upd, lines: upd ? { status: "surgical" } : null };
-  if (!fits || (!breaks.size && !sameCount(upd))) return { upd, lines: { status: "reflowed", reason: "line_count_changed" } };
+  if (!fits || (!breaks.size && !sameCount(upd))) return { upd, lines: { status: "reflowed", reason: sameCount(upd) ? "edited_line_overflows" : "line_count_changed" } };
   let cur = upd;
   if (breaks.size) {
     cur = step(undo(), lineRuns);
     if (!cur) throw new LineRetentionError("commit_failed");
   }
-  let reason = "line_count_changed";
+  let reason = null;
   if (sameCount(cur)) {
     reason = "lines_not_aligned";
     const id = cur.id ?? para.id;
@@ -299,5 +317,6 @@ export function commitRetainingLines(engine, para, runs, linePlan) {
   }
   // Restore the plain engine re-layout of the edit.
   const again = step(undo(), runs);
+  reason ??= sameCount(again) ? "edited_line_overflows" : "line_count_changed";
   return { upd: again, lines: again ? { status: "reflowed", reason } : null };
 }

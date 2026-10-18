@@ -115,6 +115,21 @@ properties currently checked. These are documented gaps, not passing negative
 tests. Independent rendering and human review remain necessary; the fixed editor
 path is not a validator for arbitrary third-party modified PDFs.
 
+## Inline style mapping and source-line retention warnings
+
+- An edit across runs of different styles keeps unchanged tokens in their own
+  run and maps a changed word to the style of the word it replaces only when
+  the token shapes agree. When a changed After word spells a source word of the
+  match in another style (canonical Unicode comparison), it may be that word
+  moved, for example `then bold` -> `bold then`; the edit is refused with
+  `STYLE_AMBIGUOUS` (`AMBIGUOUS_STYLE` per edit) instead of inventing styles.
+- A re-laid-out short edit is reported in `lineRetention`. `line_count_changed`
+  means the plain re-layout really needs a different number of lines and is not
+  warned. When the edited line alone overflows its source line but the plain
+  re-layout keeps the source line count, the reason is `edited_line_overflows`
+  and a `source_lines_reflowed` warning is raised: untouched source lines were
+  moved, not retained.
+
 ## Remaining implementation boundaries
 
 1. Pagination is bounded to the supported single-column text flow; do not claim
