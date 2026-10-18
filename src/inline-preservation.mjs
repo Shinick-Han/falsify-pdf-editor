@@ -168,9 +168,11 @@ export function canRetainLines(engine) {
 }
 
 // Glyph origins, font and size of the given text objects, grouped by the
-// nearest of the given baselines and sorted by x; a is the horizontal scale
-// of the glyph matrix (microtype font expansion) when the runtime reads it,
-// h the text object holding the glyph.
+// nearest of the given baselines and sorted by x; aspect is the horizontal
+// scale of the glyph matrix relative to its vertical scale (microtype font
+// expansion, Tz), so a uniform page CTM cancels out, and null when the
+// runtime gives no matrix or the glyph is not upright and unsheared; h is
+// the text object holding the glyph.
 function lineGlyphs(engine, handles, lines) {
   const M = engine.M;
   const own = new Set(handles.map((h) => h >>> 0));
@@ -188,13 +190,17 @@ function lineGlyphs(engine, handles, lines) {
     const len = M._FPDFText_GetFontInfo(tp, i, buf + 16, 128, buf + 144);
     const font = len > 0 && len <= 128 ? M.UTF8ToString(buf + 16, 128) : null;
     const size = M._FPDFText_GetFontSize(tp, i);
-    const a = matrix && M._FPDFText_GetMatrix(tp, i, buf + 160) ? M.HEAPF32[(buf + 160) >> 2] : null;
+    let aspect = null;
+    if (matrix && M._FPDFText_GetMatrix(tp, i, buf + 160)) {
+      const [a, b, c, d] = [0, 1, 2, 3].map((j) => M.HEAPF32[((buf + 160) >> 2) + j]);
+      if (a > 0 && d > 0 && Math.abs(b) <= ASPECT_TOL * d && Math.abs(c) <= ASPECT_TOL * d) aspect = a / d;
+    }
     let k = -1, best = Infinity;
     lines.forEach((l, j) => {
       const d = Math.abs(l.y - y);
       if (d < best) [k, best] = [j, d];
     });
-    if (k >= 0 && best <= Math.max(0.5, 0.3 * size)) out[k].push({ u, x, y, font, size, a, h });
+    if (k >= 0 && best <= Math.max(0.5, 0.3 * size)) out[k].push({ u, x, y, font, size, aspect, h });
   }
   M._free(buf);
   if (tp) M._FPDFText_ClosePage(tp);
@@ -223,6 +229,9 @@ function alignLines(engine, id, committed, source, edited) {
 }
 
 export const KEPT_LINE_TOL = 0.02;
+// Glyph aspect (horizontal over vertical matrix scale) a line-local line
+// must keep; also the shear allowed relative to the vertical scale.
+export const ASPECT_TOL = 1e-3;
 
 // Kept lines must show the same glyphs, fonts and sizes at the source
 // origins; edited lines must sit on their source baseline.
@@ -336,11 +345,12 @@ export function commitRetainingLines(engine, para, runs, linePlan) {
 // When the edit stays inside one source line, only that line is re-laid
 // out: its objects are moved off the page so the engine models them as a
 // one-line paragraph, the edit is committed there with the line's own
-// horizontal glyph scale (a justified line also gets the word spacing that
-// restores its source width), and the new line is put back on its source
-// baseline, at its source x and at its source place in the page object
-// order. No other object of the paragraph is touched, which is proven glyph
-// for glyph. Any step that does not hold is undone.
+// horizontal glyph scale relative to its vertical one (a justified line also
+// gets the word spacing that restores its source width), and the new line is
+// put back on its source baseline, at its source x and at its source place
+// in the page object order. No other object of the paragraph is touched,
+// which is proven glyph for glyph, and every glyph of the new line must show
+// the source line's aspect. Any step that does not hold is undone.
 
 const LOCAL_FNS = ["historyNoteMatrix", "historyNoteZOrder", "historyDepth", "buildModel", "resizeParagraph"];
 const LOCAL_M = ["_FPDFPage_RemoveObject", "_FPDFPage_InsertObjectAtIndex", "_FPDFPageObj_GetType", "_FPDFText_GetMatrix"];
@@ -495,8 +505,12 @@ export function commitLineLocal(engine, paras, pi, del, inserts, changed = new S
   const anchor = slots[0] > 0 ? pageBefore[slots[0] - 1] : null;
   const ownSet = new Set(own);
   const ownBounds = own.map((h) => JSON.stringify(engine.objectBounds(h)));
-  const scales = before[k].map((g) => g.a).filter(Number.isFinite).sort((a, b) => a - b);
-  const scale = scales.length ? scales[scales.length >> 1] : 1;
+  // The line's horizontal scale, not the raw matrix a: that also holds any
+  // uniform page CTM, which the engine does not re-apply to new objects.
+  const scales = before[k].map((g) => g.aspect);
+  if (!scales.every(Number.isFinite)) return { reason: "line_aspect_unsupported" };
+  const scale = [...scales].sort((a, b) => a - b)[scales.length >> 1];
+  if (scales.some((v) => Math.abs(v - scale) > ASPECT_TOL)) return { reason: "line_aspect_mixed" };
 
   let steps = 0;
   const step = (label, fn) => {
@@ -650,8 +664,10 @@ export function commitLineLocal(engine, paras, pi, del, inserts, changed = new S
   const nowHandles = (engine.paragraphObjects(now.id) || []).map((h) => h >>> 0);
   const want = new Set([...handles.filter((h) => !ownSet.has(h)), ...fresh]);
   if (nowHandles.length !== want.size || nowHandles.some((h) => !want.has(h))) return restore("paragraph_objects_changed");
-  const proof = keptLinesMatch(before, lineGlyphs(engine, nowHandles, source), new Set([k]), source);
+  const got = lineGlyphs(engine, nowHandles, source);
+  const proof = keptLinesMatch(before, got, new Set([k]), source);
   if (!proof.ok) return restore("kept_lines_moved");
+  if (!got[k].length || got[k].some((g) => !Number.isFinite(g.aspect) || Math.abs(g.aspect - scale) > ASPECT_TOL)) return restore("edited_line_aspect_changed");
   const line = now.lines[k];
   if (Math.abs(line.x - source[k].x) > PLACE_TOL || line.x + line.w > right + 0.5) return restore("edited_line_misplaced");
   if (justified && Math.abs(line.x + line.w - (source[k].x + source[k].w)) > 0.5) return restore("justification_unverified");

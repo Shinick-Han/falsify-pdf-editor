@@ -101,12 +101,15 @@ const WIDTH = 280;
 // LaTeX-like justified lines: words in one TJ with interword kerns (no space
 // characters) and, on the second line, a 98% horizontal scale standing in
 // for microtype font expansion. The kerns are fitted with the engine so
-// every line but the last spans WIDTH.
-const justifiedContent = (paras, kerns) => paras.map(({ y, lines }, n) => `BT /F1 11 Tf 15 TL 72 ${y} Td `
-  + lines.map((l, k) => `${k === 1 ? 98 : 100} Tz [` + l.split(" ").map((w) => `(${w})`).join(` ${kerns[n][k].toFixed(3)} `) + "] TJ T*").join(" ") + " ET ").join("");
-async function justifiedPdf(paras, extra = "") {
+// every line but the last spans WIDTH. With a page scale s the paragraphs
+// sit in a uniform "s 0 0 s 0 0 cm" with font size and coordinates divided
+// by s, so the page shows the same lines with glyph matrices [s,0,0,s].
+const num = (v) => +v.toFixed(4);
+const justifiedContent = (paras, kerns, s = 1) => (s === 1 ? "" : `q ${s} 0 0 ${s} 0 0 cm `) + paras.map(({ y, lines }, n) => `BT /F1 ${num(11 / s)} Tf ${num(15 / s)} TL ${num(72 / s)} ${num(y / s)} Td `
+  + lines.map((l, k) => `${k === 1 ? 98 : 100} Tz [` + l.split(" ").map((w) => `(${w})`).join(` ${kerns[n][k].toFixed(3)} `) + "] TJ T*").join(" ") + " ET ").join("") + (s === 1 ? "" : "Q ");
+async function justifiedPdf(paras, extra = "", s = 1) {
   let kerns = paras.map(({ lines }) => lines.map(() => -278));
-  const make = () => pdf(EDGES + justifiedContent(paras, kerns) + extra);
+  const make = () => pdf(EDGES + justifiedContent(paras, kerns, s) + extra);
   for (let it = 0; it < 4; it++) {
     const e = await rt.engineFactory(make());
     try {
@@ -316,4 +319,82 @@ test("real engine: a line-local commit in a later paragraph follows one in an ea
   for (const y of [560, 530, 515, 440, 425, 410, 760, 36]) assertSameLine(s, o, y);
   assert.equal(lineText(o, 545), "Theredgearandthegreyboltrestedonashelf");
   assert.equal(lineText(o, 395), "Thencalm.");
+});
+
+// Horizontal over vertical scale of a glyph matrix, and the font size the
+// page shows (size times the vertical scale).
+const aspectOf = (g) => g.matrix[0] / g.matrix[3];
+const shownSize = (g) => g.size * g.matrix[3];
+// The edited line keeps the source line's aspect and shown size on every
+// glyph, whatever page scale the source glyph matrices also hold.
+function assertSourceAspect(src, out, y, aspect) {
+  const [a, b] = [onLine(src, y), onLine(out, y)];
+  assert.ok(a.length && b.length, `line ${y} present`);
+  for (const g of a) assert.ok(Math.abs(aspectOf(g) - aspect) <= 1e-3 && Math.abs(g.matrix[1]) + Math.abs(g.matrix[2]) <= 1e-4, `source aspect ${JSON.stringify(g.matrix)}`);
+  for (const g of b) {
+    assert.ok(Math.abs(aspectOf(g) - aspect) <= 1e-3, `edited aspect ${JSON.stringify(g.matrix)} on ${y}`);
+    assert.ok(Math.abs(shownSize(g) - shownSize(a[0])) <= 0.01, `edited shown size ${g.size} ${JSON.stringify(g.matrix)} on ${y}`);
+  }
+  // Same glyph, same width: "T" opens the source and the edited line.
+  assert.equal(b[0].ch, a[0].ch);
+  assert.ok(Math.abs((b[0].right - b[0].x) - (a[0].right - a[0].x)) <= 0.02, `"${a[0].ch}" width ${b[0].right - b[0].x} vs ${a[0].right - a[0].x}`);
+}
+
+for (const s of [0.9, 0.97, 1.03]) {
+  test(`real engine: under a uniform page scale ${s} a last-line edit keeps the source glyph aspect`, { skip }, async () => {
+    const src = await justifiedPdf(ONE, "", s);
+    const { pdf: out, report } = await run(src, [{ id: "f", pageIndex: 0, before: "The end.", after: "The finish." }]);
+    assert.equal(report.ok, true, JSON.stringify(report.selfCheck?.failures));
+    assert.deepEqual(report.pages[0].paragraphs[0].lineRetention, { status: "line_local", line: 3, lines: 4, kept: 3, justified: false, wordSpacing: 0, hScale: 1, maxKeptShift: 0 });
+    const [g, o] = [await glyphsOf(src), await glyphsOf(out)];
+    for (const y of [500, 485, 470, 760, 36]) assertSameLine(g, o, y);
+    assert.equal(lineText(o, 455), "Thefinish.");
+    assert.ok(Math.abs(onLine(o, 455)[0].x - onLine(g, 455)[0].x) <= 0.1);
+    assertSourceAspect(g, o, 455, 1);
+  });
+
+  test(`real engine: under a uniform page scale ${s} a justified 98% line keeps its 98% aspect`, { skip }, async () => {
+    const src = await justifiedPdf(ONE, "", s);
+    const { pdf: out, report } = await run(src, [{ id: "g", pageIndex: 0, before: "green bolt", after: "grey bolt" }]);
+    assert.equal(report.ok, true, JSON.stringify(report.selfCheck?.failures));
+    const row = report.pages[0].paragraphs[0];
+    assert.deepEqual({ ...row.lineRetention, wordSpacing: undefined }, { status: "line_local", line: 1, lines: 4, kept: 3, justified: true, wordSpacing: undefined, hScale: 0.98, maxKeptShift: 0 });
+    const [g, o] = [await glyphsOf(src), await glyphsOf(out)];
+    for (const y of [500, 470, 455, 760, 36]) assertSameLine(g, o, y);
+    assert.equal(lineText(o, 485), "Theredgearandthegreyboltrestedonashelf");
+    const [a, b] = [onLine(g, 485), onLine(o, 485)];
+    assert.ok(Math.abs(b[0].x - a[0].x) <= 0.1);
+    assert.ok(Math.abs(b.at(-1).right - a.at(-1).right) <= 0.5);
+    assertSourceAspect(g, o, 485, 0.98);
+  });
+}
+
+test("real engine: an edited line committed with another aspect is declined to the plain re-layout", { skip }, async () => {
+  // Negative control for the edited-line aspect check: the line-local
+  // commit gets the raw glyph matrix scale (0.9 page scale times the line's
+  // own), as before the aspect was taken relative to the vertical scale.
+  const s = 0.9;
+  const src = await justifiedPdf(ONE, "", s);
+  const engineFactory = async (bytes) => {
+    const e = await rt.engineFactory(bytes);
+    const begin = e.historyBeginStep.bind(e), commit = e.commitParagraph.bind(e);
+    let label = null;
+    e.historyBeginStep = (l) => {
+      label = l;
+      return begin(l);
+    };
+    e.commitParagraph = (id, runs, fmt) => commit(id, label === "falsify-line-local" ? runs.map((r) => ({ ...r, hScale: (r.hScale ?? 1) * s })) : runs, fmt);
+    return e;
+  };
+  const edits = [{ id: "f", pageIndex: 0, before: "The end.", after: "The finish." }];
+  const { pdf: out, report } = await run(src, edits, engineFactory);
+  const row = report.pages[0].paragraphs[0];
+  assert.deepEqual(row.lineLocal, { status: "declined", reason: "edited_line_aspect_changed" });
+  assert.equal(row.lineRetention.status, "reflowed");
+  const plain = await run(src, edits, plainFactory);
+  assert.equal(plain.report.ok, report.ok);
+  assert.deepEqual(plain.report.pages[0].paragraphs[0].lineRetention, row.lineRetention);
+  const [a, b] = [await glyphsOf(plain.pdf), await glyphsOf(out)];
+  assert.deepEqual(b.map((g) => [g.ch, g.font, g.x.toFixed(3), g.y.toFixed(3), g.matrix.map((v) => v.toFixed(4))]), a.map((g) => [g.ch, g.font, g.x.toFixed(3), g.y.toFixed(3), g.matrix.map((v) => v.toFixed(4))]));
+  assert.ok(!onLine(b, 455).some((g) => Math.abs(aspectOf(g) - s) <= 1e-3), "no condensed glyph is left behind");
 });
