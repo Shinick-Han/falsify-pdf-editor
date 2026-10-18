@@ -7,7 +7,15 @@
 // All pages are planned against unchanged snapshots before any commit.
 import { loadRuntime } from "./runtime.mjs";
 import { PAGINATION_CAPABILITY, PAGINATION_LIMITS, paginateOverflow } from "./pagination.mjs";
-import { LineRetentionError, commitRetainingLines, planInlineChange, sourceLinePlan } from "./inline-preservation.mjs";
+import {
+  LineRetentionError,
+  canCommitLineLocal,
+  commitRetainingLines,
+  pageObjectList,
+  planInlineChange,
+  replaceReflowWithLineLocal,
+  sourceLinePlan,
+} from "./inline-preservation.mjs";
 
 export const LIMITS = Object.freeze({
   maxFileBytes: 64 * 1024 * 1024,
@@ -355,8 +363,30 @@ export async function editPdf(request, options = {}) {
         if (linePlan?.breaks) linePlan.lineRuns = rebuildRuns(para, del, inserts, linePlan.breaks);
         mutated = true;
         let committed;
+        let lineLocal = null;
         try {
+          // Only a stepped commit (linePlan.breaks) can be undone here.
+          const pre = linePlan?.breaks && canCommitLineLocal(engine) ? pageObjectList(engine) : null;
           committed = commitRetainingLines(engine, para, runs, linePlan);
+          // A re-layout that lost the source lines is replaced by a re-layout
+          // of the edited line alone when the edit stays inside it.
+          if (pre && committed.lines?.status === "reflowed" && committed.lines.reason !== "line_count_changed") {
+            const changed = new Set(touched.map((t) => t.index));
+            const local = replaceReflowWithLineLocal(engine, paras, pi, del, inserts, runs, pre, changed);
+            if (local.lines) {
+              committed = local;
+              // The line-local commit rebuilt the page model, which renumbers
+              // its paragraphs; the page keeps the same paragraphs in order.
+              local.ids.forEach((id, j) => {
+                paras[j].id = id;
+                context.paras[j].id = id;
+              });
+              for (const t of touched) t.id = local.ids[t.index];
+            } else {
+              committed = { upd: local.upd, lines: committed.lines };
+              lineLocal = { status: "declined", reason: local.reason };
+            }
+          }
         } catch (err) {
           if (!(err instanceof LineRetentionError)) throw err;
           throw fail(err.code === "state_drift" ? "STATE_DRIFT" : "COMMIT_FAILED", "Paragraph state could not be re-verified during a line-retaining commit", { pageIndex, paragraphId: para.id, cause: err.code });
@@ -365,11 +395,12 @@ export async function editPdf(request, options = {}) {
         if (!upd) throw fail("COMMIT_FAILED", "Engine rejected a paragraph commit", { pageIndex, paragraphId: para.id });
         const row = { index: pi, surgical: !!upd.surgical, sourceLines: para.lines?.length ?? null, committedLines: upd.lines?.length ?? null };
         if (committed.lines) row.lineRetention = committed.lines;
+        if (lineLocal) row.lineLocal = lineLocal;
         pageReport.paragraphs.push(row);
         if (committed.lines?.status === "reflowed" && committed.lines.reason !== "line_count_changed") {
           report.warnings.push({ pageIndex, code: "source_lines_reflowed", paragraphIndex: pi, reason: committed.lines.reason, severity: "warning" });
         }
-        touched.push({ id: upd.id ?? para.id, sourceBox: para.box, sourceLines: para.lines, sourceFormat: para.format });
+        touched.push({ id: upd.id ?? para.id, index: pi, sourceBox: para.box, sourceLines: para.lines, sourceFormat: para.format });
       }
       if (reflow) {
         let r;

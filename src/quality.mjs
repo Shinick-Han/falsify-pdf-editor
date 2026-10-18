@@ -620,6 +620,59 @@ export function edgeGlyphs(g) {
   return g.glyphs.filter((c) => keep.has(c));
 }
 
+// Boxes of the paragraphs a page model classifies as body (see classify)
+// that also reach out of the page's edge bands, so they cannot be a running
+// header or footer: a body paragraph whose last lines sit in the bottom band
+// of a dense page. null when model space is not plain user space.
+function bodyBoxes(engine, pageIndex, g) {
+  ensurePage(engine, pageIndex);
+  if (typeof engine.buildModel !== "function" || !uprightPage(engine) || !g.glyphs.length) return null;
+  const paras = engine.buildModel();
+  const boxes = paras.filter((p) => p.box).map((p) => p.box);
+  const edgeBottomY = boxes.length ? Math.min(0, ...boxes.map(bottomOf)) : 0;
+  const lo = Math.min(...g.glyphs.map((c) => c.b)) + EDGE_BAND * g.H;
+  const hi = Math.max(...g.glyphs.map((c) => c.t)) - EDGE_BAND * g.H;
+  return paras
+    .filter((p) => p.box && classify(p, engine.pageHeight, edgeBottomY) === "body" && p.box.top > lo && bottomOf(p.box) < hi)
+    .map((p) => p.box);
+}
+
+const inBoxes = (c, boxes) => {
+  const x = (c.l + c.r) / 2, y = (c.b + c.t) / 2;
+  return boxes.some((b) => x >= b.x - 0.5 && x <= b.x + b.w + 0.5 && y >= bottomOf(b) - 0.5 && y <= b.top + 0.5);
+};
+
+// Edge-band comparison that tells body text from headers and footers: edge
+// glyphs inside body paragraphs of the source (or, for added glyphs, of the
+// output) page may move with the body; every other source edge glyph must
+// be in the output at its position and style, and no other glyph may appear
+// in the output edge band. Returns null when no page model is available.
+function edgeBodySplit(src, out, i, oi, s, o, es, eo) {
+  const sb = bodyBoxes(src, i, s), ob = bodyBoxes(out, oi, o);
+  if (!sb || !ob) return null;
+  const pending = new Map();
+  for (const d of eo) pending.set(d.u, [...(pending.get(d.u) || []), d]);
+  const at = (c) => {
+    const list = pending.get(c.u) || [];
+    const k = list.findIndex((d) => Math.abs(c.l - d.l) <= 0.5 && Math.abs(c.b - d.b) <= 0.5 && sameStyle(c.style ?? null, d.style ?? null));
+    return k < 0 ? null : list.splice(k, 1)[0];
+  };
+  let bodyChanged = 0, edgeMissing = 0;
+  for (const c of es) {
+    if (at(c)) continue;
+    if (inBoxes(c, sb)) bodyChanged++;
+    else edgeMissing++;
+  }
+  let edgeAdded = 0;
+  for (const list of pending.values()) {
+    for (const d of list) {
+      if (inBoxes(d, ob) || inBoxes(d, sb)) bodyChanged++;
+      else edgeAdded++;
+    }
+  }
+  return { bodyChanged, edgeMissing, edgeAdded };
+}
+
 function extents(g) {
   if (!g.glyphs.length) return null;
   return { left: Math.min(...g.glyphs.map((c) => c.l)), right: Math.max(...g.glyphs.map((c) => c.r)) };
@@ -713,8 +766,11 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
       if (!stable) {
         const edgeText = normStr(String.fromCharCode(...es.map((c) => c.u)));
         const editsEdge = pageEdits.some((e) => edgeText.replace(/ /g, "").includes(normStr(e.before).replace(/ /g, "")));
+        const split = editsEdge ? null : edgeBodySplit(src, out, i, m.outputPageIndex, s, o, es, eo);
+        if (split) row.edge_split = split;
         if (editsEdge) warnings.push({ code: "edge_edit_unverified", pageIndex: i });
-        else failures.push({ code: "header_footer_moved", pageIndex: i });
+        else if (!split || split.edgeMissing || split.edgeAdded) failures.push({ code: "header_footer_moved", pageIndex: i, ...(split || {}) });
+        else warnings.push({ code: "edge_band_body_changed", pageIndex: i, count: split.bodyChanged });
       }
     }
     report.ok = failures.length === 0;
