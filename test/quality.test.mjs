@@ -216,13 +216,14 @@ test("no room above the footer: footer is not moved and pagination is reported",
 // ---------- inspectSavedPdf ----------
 
 // glyph pages: arrays of [char, x, y]; spaces are generated text only.
-function pdfEngineFor(pages) {
+// models (optional): bytes -> per-page paragraph models for buildModel.
+function pdfEngineFor(pages, models) {
   return async () => {
     const heap = new Float64Array(8);
-    let doc = null;
+    let doc = null, model = null;
     const e = {
       pageCount: 0, page: 0, pageIndex: -1,
-      open(bytes) { doc = pages.get(bytes); this.pageCount = doc.length; },
+      open(bytes) { doc = pages.get(bytes); model = models?.get(bytes) ?? null; this.pageCount = doc.length; },
       close() {},
       loadPage(i) { this.pageIndex = i; this.page = i + 1; },
       M: {
@@ -242,6 +243,7 @@ function pdfEngineFor(pages) {
         },
       },
     };
+    if (models) e.buildModel = () => model?.[e.pageIndex] ?? [];
     return e;
   };
 }
@@ -297,4 +299,50 @@ test("inspect rejects overlapping text", async () => {
 test("ambiguous expected text is a failure, not a guess", () => {
   assert.equal(expectedPageText("a b a b", [{ id: "x", before: "a b", after: "c" }]).ok, false);
   assert.equal(expectedPageText("one  two\nthree", [{ id: "x", before: "two three", after: "2 3" }]).text, "one 2 3");
+});
+
+// A dense page whose body paragraph ends inside the bottom edge band: its
+// last line "gamma" (centre y 95) is edge-band text that belongs to body.
+function setupEdgeBody(outPages, outModel) {
+  const src = new Uint8Array([3]), out = new Uint8Array([4]);
+  const body = (x = 50, first = "alpha delta") => [...line(first, 50, 114), [" ", 0, 0], ...line("gamma", x, 90)];
+  const model = (title = 780) => [[
+    { id: 1, box: { x: 270, top: title, w: 35, h: 10 }, lines: [{ y: title - 10 }], runs: [{ text: "Title" }] },
+    { id: 2, box: { x: 50, top: 124, w: 76, h: 34 }, lines: [{ y: 114 }, { y: 90 }], runs: [{ text: "alpha beta gamma" }] },
+    { id: 3, box: { x: 297, top: 40, w: 6, h: 10 }, lines: [{ y: 30 }], runs: [{ text: "7" }] },
+  ]];
+  const pages = new Map([[src, [page(body(50, "alpha beta"))]], [out, outPages(body)]]);
+  const models = new Map([[src, model()], [out, outModel(model)]]);
+  return { factory: pdfEngineFor(pages, models), src, out };
+}
+
+test("body movement inside an edge band stays a failure with its own code", async () => {
+  // The split identifies "gamma" as body text, which names the failure; it
+  // is no proof the movement was authorized, so the check must not pass.
+  const { factory, src, out } = setupEdgeBody((body) => [page(body(53))], (model) => model());
+  const r = await inspectSavedPdf(factory, src, out, edit);
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.failures.map((f) => f.code), ["edge_band_body_changed"]);
+  assert.equal(r.failures[0].count, 10);
+  assert.ok(!r.warnings.some((w) => w.code === "edge_band_body_changed"));
+  assert.deepEqual(r.pages[0].edge_split, { bodyChanged: 10, edgeMissing: 0, edgeAdded: 0 });
+});
+
+test("a moved header still fails as header_footer_moved when a page model exists", async () => {
+  const moved = (body) => [[...line("Title", 270, 760), [" ", 0, 0], ...body(), [" ", 0, 0], ...line("7", 297, 30)]];
+  const { factory, src, out } = setupEdgeBody(moved, (model) => model(770));
+  const r = await inspectSavedPdf(factory, src, out, edit);
+  assert.equal(r.ok, false);
+  const f = r.failures.find((x) => x.code === "header_footer_moved");
+  assert.ok(f, JSON.stringify(r.failures));
+  assert.equal(f.edgeMissing, 5);
+  assert.equal(f.edgeAdded, 5);
+  assert.ok(!r.failures.some((x) => x.code === "edge_band_body_changed"));
+});
+
+test("an unchanged edge band with a page model passes", async () => {
+  const { factory, src, out } = setupEdgeBody((body) => [page(body())], (model) => model());
+  const r = await inspectSavedPdf(factory, src, out, edit);
+  assert.equal(r.ok, true, JSON.stringify(r.failures));
+  assert.equal(r.pages[0].edge_stable, true);
 });

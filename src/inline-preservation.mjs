@@ -535,6 +535,9 @@ export function commitLineLocal(engine, paras, pi, del, inserts, changed = new S
     return restore("history_unavailable");
   }
   const iso = engine.buildModel();
+  // The undo steps refer to object handles; a model build that re-created
+  // page objects leaves them pointing elsewhere, so nothing can be undone.
+  if (pageObjectList(engine).join(",") !== pageBefore.join(",")) throw new LineRetentionError("state_drift", { after: "line_isolate", part: "page_objects_rebuilt" });
   const mine = iso.filter((q) => (engine.paragraphObjects(q.id) || []).some((h) => ownSet.has(h >>> 0)));
   if (mine.length !== 1) return restore("line_not_isolated");
   const q = mine[0];

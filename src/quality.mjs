@@ -642,11 +642,13 @@ const inBoxes = (c, boxes) => {
   return boxes.some((b) => x >= b.x - 0.5 && x <= b.x + b.w + 0.5 && y >= bottomOf(b) - 0.5 && y <= b.top + 0.5);
 };
 
-// Edge-band comparison that tells body text from headers and footers: edge
+// Edge-band diagnosis that tells body text from headers and footers: edge
 // glyphs inside body paragraphs of the source (or, for added glyphs, of the
-// output) page may move with the body; every other source edge glyph must
-// be in the output at its position and style, and no other glyph may appear
-// in the output edge band. Returns null when no page model is available.
+// output) page count as body changes; every other source edge glyph must be
+// in the output at its position and style, and no other glyph may appear in
+// the output edge band. The split only names the failure accurately: body
+// movement in an edge band is not shown to be authorized by it, so it still
+// fails. Returns null when no page model is available.
 function edgeBodySplit(src, out, i, oi, s, o, es, eo) {
   const sb = bodyBoxes(src, i, s), ob = bodyBoxes(out, oi, o);
   if (!sb || !ob) return null;
@@ -770,7 +772,7 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
         if (split) row.edge_split = split;
         if (editsEdge) warnings.push({ code: "edge_edit_unverified", pageIndex: i });
         else if (!split || split.edgeMissing || split.edgeAdded) failures.push({ code: "header_footer_moved", pageIndex: i, ...(split || {}) });
-        else warnings.push({ code: "edge_band_body_changed", pageIndex: i, count: split.bodyChanged });
+        else failures.push({ code: "edge_band_body_changed", pageIndex: i, count: split.bodyChanged });
       }
     }
     report.ok = failures.length === 0;

@@ -350,7 +350,13 @@ export async function editPdf(request, options = {}) {
       if (plan.perPara.size === 0) continue;
       const at = pageIndex + added;
       engine.loadPage(at);
+      // A line-local commit undoes steps by object handle, so it needs a page
+      // whose model build keeps every page object: a build that re-creates
+      // objects (seen for text objects with word spacing) would point those
+      // steps at other objects. Such a page keeps the plain re-layout.
+      const objectsBefore = canCommitLineLocal(engine) ? pageObjectList(engine).join(",") : null;
       const paras = engine.buildModel();
+      const localStable = objectsBefore !== null && pageObjectList(engine).join(",") === objectsBefore;
       if (snapshotKey(paras) !== key) throw fail("STATE_DRIFT", "Page model changed between planning and commit", { pageIndex });
       const context = quality.capturePageLayout(engine, at, paras);
       const touched = [];
@@ -366,11 +372,13 @@ export async function editPdf(request, options = {}) {
         let lineLocal = null;
         try {
           // Only a stepped commit (linePlan.breaks) can be undone here.
-          const pre = linePlan?.breaks && canCommitLineLocal(engine) ? pageObjectList(engine) : null;
+          const pre = linePlan?.breaks && localStable ? pageObjectList(engine) : null;
           committed = commitRetainingLines(engine, para, runs, linePlan);
+          const lost = committed.lines?.status === "reflowed" && committed.lines.reason !== "line_count_changed";
+          if (lost && linePlan?.breaks && objectsBefore !== null && !localStable) lineLocal = { status: "declined", reason: "page_model_unstable" };
           // A re-layout that lost the source lines is replaced by a re-layout
           // of the edited line alone when the edit stays inside it.
-          if (pre && committed.lines?.status === "reflowed" && committed.lines.reason !== "line_count_changed") {
+          if (pre && lost) {
             const changed = new Set(touched.map((t) => t.index));
             const local = replaceReflowWithLineLocal(engine, paras, pi, del, inserts, runs, pre, changed);
             if (local.lines) {
