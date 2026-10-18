@@ -106,14 +106,40 @@ SNAPSHOT=patched RECORD_PATCHES="pdfium=$PWD/patches/pdfium-stream-order.patch" 
   scripts/rebuild-wasm.sh provenance
 ```
 
-It refuses a stale snapshot (outputs, static library or source diffs changed
-since `snapshot`), refuses a listed patch that does not reverse-apply in its
-repository, and writes `out/$SNAPSHOT/provenance.json` once
-(`editor-wasm-build-provenance/1`): engine/PDFium URLs, commits and diff
-digests, the engine's three build patches, extra patches, the script's own
-SHA-256, toolchain versions and the SHA-256 and size of each artifact. It
-describes one build root at one moment; it is not an independent or
-clean-room build and not a signed attestation.
+`snapshot` (format `editor-wasm-build-snapshot/2`) records, for both the
+engine and PDFium checkouts, the tracked diff, `git status --porcelain
+--untracked-files=all` and an inventory of untracked source files (`git
+ls-files --others --exclude-standard`, so ignored build outputs and the
+gclient dependency checkouts are excluded) with the SHA-256 of each file's
+content, plus `OUT_NAME`. All of them are listed in `SHA256SUMS`. An
+untracked symlink, nested repository or other non-regular entry is refused
+(never followed), and nothing is created until the source state has been read.
+Untracked files created by the engine's build patches (for example
+`core/fxcodec/brotli/`) or by extra patches are ordinary inventory entries.
+
+`provenance` refuses a stale snapshot: outputs or static library differ, a
+snapshot file is missing, tampered or not listed in `SHA256SUMS`, or either
+tree's tracked diff, status or untracked inventory (added, deleted or changed
+file) differs from the snapshot. It refuses a listed patch that does not
+reverse-apply in its repository and fails closed on every read: a git,
+toolchain, hash or size command that exits nonzero (even with output) or
+prints nothing stops the stage before any file is written. It then writes
+`out/$SNAPSHOT/provenance.json` once (`editor-wasm-build-provenance/2`):
+engine/PDFium URLs, commits and diff, status and untracked-inventory digests,
+`OUT_NAME`, the engine's three build patches, extra patches, the script's own
+SHA-256, toolchain versions (first line of each) and the SHA-256 and size of
+each artifact. It describes one build root at one moment; it is not an
+independent or clean-room build and not a signed attestation, and it does not
+bind the nested gclient dependency revisions (`inventory` lists them).
+
+Snapshots taken by earlier versions of the script (no `snapshot.format`, no
+engine status or untracked inventory) are refused by `provenance` with a
+migration message: take a new snapshot under a new name and describe that.
+Their existing `editor-wasm-build-provenance/1` records stay as they are and
+do not gain the stronger claims.
+
+`test/rebuild-wasm-provenance.test.sh` exercises the snapshot and provenance
+stages on a mock build root under `$HOME` (no toolchain or compile needed).
 
 What it pins and isolates:
 

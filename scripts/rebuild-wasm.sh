@@ -27,11 +27,13 @@
 #   exports     clang AST dump of public headers -> exported-*.txt
 #   link        em++ ESM link -> build/wasm/pdfium.{js,wasm}
 #   snapshot    copy outputs to a new $BUILD_ROOT/out/$SNAPSHOT and, if set,
-#               to CANDIDATE_DIR (new or empty apart from package.json)
+#               to CANDIDATE_DIR (new or empty apart from package.json), with
+#               source diffs, git status and untracked file inventories
 #   provenance  write $BUILD_ROOT/out/$SNAPSHOT/provenance.json for an existing
-#               snapshot that still matches build/wasm: pins, diffs, patches
-#               verified as applied (RECORD_PATCHES="pdfium=/p engine=/p"),
-#               script and tool versions, artifact digests and sizes
+#               snapshot that still matches build/wasm and both source trees:
+#               pins, diffs, status, untracked files, patches verified as
+#               applied (RECORD_PATCHES="pdfium=/p engine=/p"), script and
+#               tool versions, artifact digests and sizes
 #   inventory   record tool versions, gclient revinfo and license files
 #
 # OUT_NAME (default wasm) selects the GN output directory pdfium-src/out/NAME,
@@ -109,6 +111,11 @@ WS=$PDFIUM/build/wasm
 # Files the exports and link stages may (over)write in $WS, and nothing else.
 WS_FILES=(all.h ast.json exported-functions.txt exported-runtime-methods.txt
           functions.ts runtime-methods.ts pdfium.js pdfium.wasm)
+# Files of a snapshot, listed in its SHA256SUMS in exactly this order.
+SNAPSHOT_FILES=(pdfium.js pdfium.wasm exported-functions.txt exported-runtime-methods.txt
+                libembedpdf.a engine.diff pdfium.diff engine.status pdfium.status
+                engine.untracked pdfium.untracked snapshot.format)
+SNAPSHOT_FORMAT=editor-wasm-build-snapshot/2
 
 for d in "$TOOLS" "$BUILD_ROOT/src" "$BUILD_ROOT/cache" "$BUILD_ROOT/logs" "$BUILD_ROOT/out"; do
   real_dir "$d"
@@ -324,6 +331,84 @@ stage_link() {
   sha256sum ./wasm/pdfium.js ./wasm/pdfium.wasm
 }
 
+# Snapshot and provenance reads fail closed. set -e does not see a command
+# substitution that fails inside an argument, so every value is captured into
+# a variable first and its exit status and content are checked.
+# out_of VAR CMD...: VAR=stdout of CMD (may be empty); a nonzero exit dies.
+out_of() {
+  local __out
+  __out=$("${@:2}") || die "command failed: ${*:2}"
+  printf -v "$1" '%s' "$__out"
+}
+
+# cap VAR CMD...: as out_of; the output must not be empty.
+cap() {
+  out_of "$@"
+  [[ -n ${!1} ]] || die "empty output: ${*:2}"
+}
+
+# first_line VAR CMD...: first line of a nonempty output (full capture, no
+# head pipeline that could end the command with SIGPIPE).
+first_line() {
+  cap "$@"
+  printf -v "$1" '%s' "${!1%%$'\n'*}"
+  [[ -n ${!1} ]] || die "empty first line: ${*:2}"
+}
+
+# sha_of VAR FILE: SHA-256 of a regular file.
+sha_of() {
+  [[ -f $2 && ! -L $2 ]] || die "not a regular file: $2"
+  cap "$1" sha256sum -- "$2"
+  printf -v "$1" '%s' "${!1%% *}"
+  [[ ${!1} =~ ^[0-9a-f]{64}$ ]] || die "bad SHA-256 for $2"
+}
+
+# sha_out VAR CMD...: SHA-256 of the (possibly empty or binary) output of CMD.
+sha_out() {
+  local __sha
+  __sha=$("${@:2}" | sha256sum) || die "command failed: ${*:2}"
+  __sha=${__sha%% *}
+  [[ $__sha =~ ^[0-9a-f]{64}$ ]] || die "bad SHA-256 of: ${*:2}"
+  printf -v "$1" '%s' "$__sha"
+}
+
+# rev_of VAR DIR: HEAD commit of the git repository whose top level is DIR
+# (never of an enclosing repository).
+rev_of() {
+  local __top
+  cap __top git -C "$2" rev-parse --show-toplevel
+  [[ $__top == "$(realpath -e -- "$2")" ]] || die "$2 is not the top of a git repository"
+  cap "$1" git -C "$2" rev-parse HEAD
+  [[ ${!1} =~ ^[0-9a-f]{40}$ ]] || die "bad HEAD in $2"
+}
+
+# git_status VAR REPO: porcelain status of REPO including every untracked file.
+git_status() {
+  out_of "$1" git --no-optional-locks -C "$2" status --porcelain --untracked-files=all
+}
+
+# untracked_inventory REPO: "sha256  path" for each untracked, non-ignored
+# file (git ls-files --others --exclude-standard; ignored build outputs are
+# excluded), in git's order. Refuses symlinks without following them, nested
+# repositories and anything else that is not a regular file, and paths that
+# contain a newline.
+untracked_inventory() {
+  local repo=$1 raw p h out=
+  raw=$(git -C "$repo" ls-files -z --others --exclude-standard | tr '\n\0' '\001\n') ||
+    die "git ls-files failed in $repo"
+  [[ $raw != *$'\001'* ]] || die "untracked path with a newline in $repo"
+  while IFS= read -r p; do
+    [[ -n $p ]] || continue
+    [[ ! -L $repo/$p ]] || die "untracked symlink in $repo: $p"
+    [[ -f $repo/$p ]] || die "untracked entry is not a regular file in $repo: $p"
+    sha_of h "$repo/$p"
+    out+="$h  $p"$'\n'
+  done <<< "$raw"
+  printf '%s' "$out"
+}
+
+snapshot_format_text() { printf '%s\nout_name=%s\n' "$SNAPSHOT_FORMAT" "$OUT_NAME"; }
+
 # guard_candidate_dir: CANDIDATE_DIR is new, or a real directory that holds
 # at most a package.json; never an existing pdfium.js/pdfium.wasm.
 guard_candidate_dir() {
@@ -351,14 +436,25 @@ stage_snapshot() {
   prepare_ws
   local dest=$BUILD_ROOT/out/$SNAPSHOT
   [[ ! -e $dest && ! -L $dest ]] || die "$dest already exists; choose a new SNAPSHOT"
+  # Read the source state before anything is created.
+  local rev e_status p_status e_inv p_inv
+  rev_of rev "$ENGINE"
+  rev_of rev "$SRC"
+  git_status e_status "$ENGINE"
+  git_status p_status "$SRC"
+  e_inv=$(untracked_inventory "$ENGINE") || die "untracked inventory failed in $ENGINE"
+  p_inv=$(untracked_inventory "$SRC") || die "untracked inventory failed in $SRC"
   mkdir -- "$dest"
   cp -- "$WS/pdfium.js" "$WS/pdfium.wasm" "$WS/exported-functions.txt" \
         "$WS/exported-runtime-methods.txt" "$OUT/obj/libembedpdf.a" "$dest/"
   git -C "$ENGINE" diff --binary > "$dest/engine.diff"
   git -C "$SRC" diff --binary > "$dest/pdfium.diff"
-  git -C "$SRC" status --porcelain > "$dest/pdfium.status"
-  ( cd "$dest" && sha256sum pdfium.js pdfium.wasm exported-functions.txt \
-      exported-runtime-methods.txt libembedpdf.a engine.diff pdfium.diff | tee SHA256SUMS )
+  printf '%s' "$e_status" > "$dest/engine.status"
+  printf '%s' "$p_status" > "$dest/pdfium.status"
+  printf '%s' "$e_inv" > "$dest/engine.untracked"
+  printf '%s' "$p_inv" > "$dest/pdfium.untracked"
+  snapshot_format_text > "$dest/snapshot.format"
+  ( cd "$dest" && sha256sum -- "${SNAPSHOT_FILES[@]}" | tee SHA256SUMS )
   if [[ -n $CANDIDATE_DIR ]]; then
     mkdir -p -- "$CANDIDATE_DIR"
     # guard_candidate_dir has already refused existing pdfium.js/pdfium.wasm.
@@ -372,44 +468,73 @@ stage_snapshot() {
 # stage_provenance: describe an existing snapshot from the live build root.
 # Every value is read or recomputed here; nothing is taken on trust from the
 # caller except which extra patch files to check (and they must reverse-apply).
+# Only snapshots in SNAPSHOT_FORMAT (with status and untracked inventories)
+# are described; a legacy snapshot is refused rather than given this record.
 stage_provenance() {
   activate_tools
   [[ $SNAPSHOT =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "SNAPSHOT must be a simple name"
-  local dest=$BUILD_ROOT/out/$SNAPSHOT f
+  local dest=$BUILD_ROOT/out/$SNAPSHOT f v
   [[ -d $dest && ! -L $dest ]] || die "$dest is not an existing snapshot"
-  [[ ! -e $dest/provenance.json ]] || die "$dest/provenance.json already exists"
+  [[ ! -e $dest/provenance.json && ! -L $dest/provenance.json ]] ||
+    die "$dest/provenance.json already exists"
+  [[ -f $dest/snapshot.format && ! -L $dest/snapshot.format ]] ||
+    die "$dest is a legacy snapshot without git status or untracked inventory; it cannot get a $SNAPSHOT_FORMAT provenance record. Migrate by taking a new snapshot (SNAPSHOT=<new name> $0 snapshot) and describing that; existing records stay unchanged"
+  snapshot_format_text | cmp -s - "$dest/snapshot.format" ||
+    die "$dest/snapshot.format is not $SNAPSHOT_FORMAT with out_name=$OUT_NAME"
+  out_of v cut -c67- -- "$dest/SHA256SUMS"
+  [[ $v == "$(printf '%s\n' "${SNAPSHOT_FILES[@]}")" ]] ||
+    die "$dest/SHA256SUMS does not list exactly the snapshot files"
+  ( cd "$dest" && sha256sum -c --quiet SHA256SUMS ) || die "SHA256SUMS check failed in $dest"
   for f in pdfium.js pdfium.wasm exported-functions.txt exported-runtime-methods.txt; do
     cmp -s "$dest/$f" "$WS/$f" || die "$dest/$f differs from $WS/$f; snapshot is stale"
   done
   cmp -s "$dest/libembedpdf.a" "$OUT/obj/libembedpdf.a" || die "$dest/libembedpdf.a differs from $OUT"
-  ( cd "$dest" && sha256sum -c --quiet SHA256SUMS ) || die "SHA256SUMS check failed in $dest"
-  [[ $(git -C "$ENGINE" diff --binary | sha256sum) == "$(sha256sum < "$dest/engine.diff")" ]] ||
-    die "engine tree changed since snapshot"
-  [[ $(git -C "$SRC" diff --binary | sha256sum) == "$(sha256sum < "$dest/pdfium.diff")" ]] ||
-    die "pdfium tree changed since snapshot"
+  local e_rev p_rev live snap name repo_dir
+  rev_of e_rev "$ENGINE"
+  rev_of p_rev "$SRC"
+  for name in engine pdfium; do
+    if [[ $name == engine ]]; then repo_dir=$ENGINE; else repo_dir=$SRC; fi
+    sha_out live git -C "$repo_dir" diff --binary
+    sha_of snap "$dest/$name.diff"
+    [[ $live == "$snap" ]] || die "$name tree changed since snapshot (tracked diff)"
+    git_status live "$repo_dir"
+    printf '%s' "$live" | cmp -s - "$dest/$name.status" ||
+      die "$name tree changed since snapshot (git status)"
+    live=$(untracked_inventory "$repo_dir") || die "untracked inventory failed in $repo_dir"
+    printf '%s' "$live" | cmp -s - "$dest/$name.untracked" ||
+      die "$name tree changed since snapshot (untracked files)"
+  done
   # kv KEY VALUE: one tab-separated record; KEY is a slash-separated JSON path.
+  # An empty value is refused, so no field is ever recorded blank.
   local rec=
-  kv() { rec+=$(printf '%s\t%s' "$1" "${2//$'\t'/ }")$'\n'; }
-  kv schema editor-wasm-build-provenance/1
-  kv created_utc "$(date -u +%FT%TZ)"
+  kv() {
+    [[ -n $2 ]] || die "empty provenance value: $1"
+    rec+=$(printf '%s\t%s' "$1" "${2//$'\t'/ }")$'\n'
+  }
+  kv schema editor-wasm-build-provenance/2
+  cap v date -u +%FT%TZ; kv created_utc "$v"
   kv snapshot "$SNAPSHOT"
+  kv snapshot_format "$SNAPSHOT_FORMAT"
   kv build_root "$BUILD_ROOT"
+  kv out_name "$OUT_NAME"
   kv out_dir "$OUT"
   kv jobs "$JOBS"
   kv script/path "$SCRIPT_PATH"
-  kv script/sha256 "$(sha256sum < "$SCRIPT_PATH" | cut -d' ' -f1)"
-  kv engine/url "$(git -C "$ENGINE" remote get-url origin)"
-  kv engine/commit "$(git -C "$ENGINE" rev-parse HEAD)"
-  kv engine/diff_sha256 "$(sha256sum < "$dest/engine.diff" | cut -d' ' -f1)"
-  kv pdfium/url "$(git -C "$SRC" remote get-url origin)"
-  kv pdfium/commit "$(git -C "$SRC" rev-parse HEAD)"
-  kv pdfium/diff_sha256 "$(sha256sum < "$dest/pdfium.diff" | cut -d' ' -f1)"
-  kv pdfium/status_sha256 "$(sha256sum < "$dest/pdfium.status" | cut -d' ' -f1)"
+  sha_of v "$SCRIPT_PATH"; kv script/sha256 "$v"
+  cap v git -C "$ENGINE" remote get-url origin; kv engine/url "$v"
+  kv engine/commit "$e_rev"
+  cap v git -C "$SRC" remote get-url origin; kv pdfium/url "$v"
+  kv pdfium/commit "$p_rev"
+  for name in engine pdfium; do
+    for f in diff status untracked; do
+      sha_of v "$dest/$name.$f"; kv "$name/${f}_sha256" "$v"
+    done
+  done
   local p
   for p in security-fixes editcore-pdfium brotli-decode; do
     git -C "$SRC" apply --reverse --check "$PDFIUM/build/patch/$p.patch" >/dev/null 2>&1 ||
       die "engine build patch $p is not applied"
-    kv "engine_build_patches/$p" "$(sha256sum < "$PDFIUM/build/patch/$p.patch" | cut -d' ' -f1)"
+    sha_of v "$PDFIUM/build/patch/$p.patch"; kv "engine_build_patches/$p" "$v"
   done
   local spec repo repo_dir path i=0
   for spec in ${RECORD_PATCHES:-}; do
@@ -421,21 +546,23 @@ stage_provenance() {
       die "not applied in $repo: $path"
     kv "extra_patches/$i/repo" "$repo"
     kv "extra_patches/$i/name" "${path##*/}"
-    kv "extra_patches/$i/sha256" "$(sha256sum < "$path" | cut -d' ' -f1)"
+    sha_of v "$path"; kv "extra_patches/$i/sha256" "$v"
     i=$((i + 1))
   done
   kv toolchain/emsdk_version "$EMSDK_VERSION"
-  kv toolchain/emsdk_commit "$(git -C "$EMSDK_DIR" rev-parse HEAD)"
-  kv toolchain/emcc "$(emcc --version | head -1)"
-  kv toolchain/clang "$(clang --version | head -1)"
-  kv toolchain/node "$(node --version)"
-  kv toolchain/python3 "$(python3 --version 2>&1)"
-  kv toolchain/depot_tools "$(git -C "$DEPOT_TOOLS" rev-parse HEAD)"
-  kv toolchain/gn "$("$SRC/buildtools/linux64/gn" --version)"
-  kv toolchain/ninja "$("$SRC/third_party/ninja/ninja" --version)"
+  rev_of v "$EMSDK_DIR"; kv toolchain/emsdk_commit "$v"
+  first_line v emcc --version; kv toolchain/emcc "$v"
+  first_line v clang --version; kv toolchain/clang "$v"
+  first_line v node --version; kv toolchain/node "$v"
+  first_line v python3 --version; kv toolchain/python3 "$v"
+  rev_of v "$DEPOT_TOOLS"; kv toolchain/depot_tools "$v"
+  first_line v "$SRC/buildtools/linux64/gn" --version; kv toolchain/gn "$v"
+  first_line v "$SRC/third_party/ninja/ninja" --version; kv toolchain/ninja "$v"
   for f in pdfium.js pdfium.wasm libembedpdf.a exported-functions.txt exported-runtime-methods.txt; do
-    kv "artifacts/$f/sha256" "$(sha256sum < "$dest/$f" | cut -d' ' -f1)"
-    kv "artifacts/$f/bytes" "$(stat -c %s -- "$dest/$f")"
+    sha_of v "$dest/$f"; kv "artifacts/$f/sha256" "$v"
+    cap v stat -c %s -- "$dest/$f"
+    [[ $v =~ ^[0-9]+$ ]] || die "bad size for $dest/$f"
+    kv "artifacts/$f/bytes" "$v"
   done
   kv scope "state of this build root when the snapshot was described; not an independent or clean-room build"
   printf '%s' "$rec" | python3 -c '
@@ -485,7 +612,7 @@ stage_inventory() {
   cat "$inv/tools.txt"
 }
 
-[[ $# -gt 0 ]] || { sed -n '2,42p' "$0"; exit 2; }
+[[ $# -gt 0 ]] || { sed -n '2,43p' "$0"; exit 2; }
 for stage in "$@"; do
   case $stage in
     fetch|toolchain|sync|prepare|patch|configure|lib|exports|link|snapshot|provenance|inventory) ;;
