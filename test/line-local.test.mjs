@@ -398,3 +398,21 @@ test("real engine: an edited line committed with another aspect is declined to t
   assert.deepEqual(b.map((g) => [g.ch, g.font, g.x.toFixed(3), g.y.toFixed(3), g.matrix.map((v) => v.toFixed(4))]), a.map((g) => [g.ch, g.font, g.x.toFixed(3), g.y.toFixed(3), g.matrix.map((v) => v.toFixed(4))]));
   assert.ok(!onLine(b, 455).some((g) => Math.abs(aspectOf(g) - s) <= 1e-3), "no condensed glyph is left behind");
 });
+
+test("real engine: a line whose glyph aspect cannot be read is declined to the plain re-layout", { skip }, async () => {
+  const src = await justifiedPdf(ONE, "", 0.9);
+  // No glyph matrix is readable while the edit is committed: the source
+  // aspect is unknown, so no line-local commit is tried.
+  const engineFactory = async (bytes) => {
+    const e = await rt.engineFactory(bytes);
+    e.M._FPDFText_GetMatrix = () => 0;
+    return e;
+  };
+  const edits = [{ id: "f", pageIndex: 0, before: "The end.", after: "The finish." }];
+  const { report } = await run(src, edits, engineFactory);
+  const row = report.pages[0].paragraphs[0];
+  assert.deepEqual(row.lineLocal, { status: "declined", reason: "line_aspect_unsupported" });
+  assert.equal(row.lineRetention.status, "reflowed");
+  const plain = await run(src, edits, plainFactory);
+  assert.deepEqual(plain.report.pages[0].paragraphs[0].lineRetention, row.lineRetention);
+});

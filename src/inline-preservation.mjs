@@ -508,7 +508,7 @@ export function commitLineLocal(engine, paras, pi, del, inserts, changed = new S
   // The line's horizontal scale, not the raw matrix a: that also holds any
   // uniform page CTM, which the engine does not re-apply to new objects.
   const scales = before[k].map((g) => g.aspect);
-  if (!scales.every(Number.isFinite)) return { reason: "line_aspect_unsupported" };
+  if (!scales.length || !scales.every(Number.isFinite)) return { reason: "line_aspect_unsupported" };
   const scale = [...scales].sort((a, b) => a - b)[scales.length >> 1];
   if (scales.some((v) => Math.abs(v - scale) > ASPECT_TOL)) return { reason: "line_aspect_mixed" };
 
