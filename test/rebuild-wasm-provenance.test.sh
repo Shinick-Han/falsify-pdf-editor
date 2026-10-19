@@ -143,8 +143,9 @@ def walk(x, p=""):
     else:
         assert isinstance(x, str) and x, "empty value at " + p
 walk(d)
-assert d["schema"] == "editor-wasm-build-provenance/2", d["schema"]
-assert d["snapshot_format"] == "editor-wasm-build-snapshot/2"
+assert d["schema"] == "editor-wasm-build-provenance/3", d["schema"]
+assert d["snapshot_format"] == "editor-wasm-build-snapshot/3"
+assert len(d["heads_sha256"]) == 64
 assert d["out_name"] == "wasm"
 tc = d["toolchain"]
 assert tc["emcc"] == "emcc (mock) 3.1.70", tc["emcc"]
@@ -154,8 +155,23 @@ for r in ("engine", "pdfium"):
     assert len(d[r]["commit"]) == 40
     for k in ("diff_sha256", "status_sha256", "untracked_sha256"):
         assert len(d[r][k]) == 64, (r, k)
+    assert d[r]["index"].startswith("equal to HEAD"), r
 assert d["extra_patches"][0]["repo"] == "engine"
+heads = open(sys.argv[1].rsplit("/", 1)[0] + "/heads").read()
+assert heads == "engine %s\npdfium %s\n" % (d["engine"]["commit"], d["pdfium"]["commit"]), heads
 EOF
+}
+
+# snap_refused LABEL SNAPSHOT PATTERN: snapshot exits nonzero with PATTERN on
+# stderr and creates nothing.
+snap_refused() {
+  if stage snapshot SNAPSHOT="$2"; then bad "$1"; return; fi
+  if grep -qF -- "$3" "$R/last.err" && [[ ! -e $R/out/$2 && ! -L $R/out/$2 ]]; then
+    ok "$1"
+  else
+    cat "$R/last.err"
+    bad "$1"
+  fi
 }
 
 # expect_pass LABEL SNAPSHOT [VAR=VALUE...]
@@ -190,7 +206,7 @@ expect_fail() {
 resum() {
   ( cd "$1" && sha256sum -- pdfium.js pdfium.wasm exported-functions.txt exported-runtime-methods.txt \
       libembedpdf.a engine.diff pdfium.diff engine.status pdfium.status \
-      engine.untracked pdfium.untracked snapshot.format > SHA256SUMS )
+      engine.untracked pdfium.untracked snapshot.format heads > SHA256SUMS )
 }
 
 # --- tests ---------------------------------------------------------------
@@ -282,7 +298,65 @@ for name in engine pdfium; do
   snap "miss-$name"
   mv -- "$R/out/miss-$name/$name.status" "$ATTIC/$name.status-miss"
   expect_fail "$name: missing status file fails" "miss-$name" "SHA256SUMS check failed"
+
+  # Index binding: tf is tracked and modified in the worktree by a patch, cf
+  # is tracked and clean.
+  if [[ $name == engine ]]; then tf=editcore/x.cpp cf=README; else tf=core/a.c cf=.gitignore; fi
+  g -C "$dir" add -- "$tf"
+  snap_refused "$name: snapshot refuses a staged change" "stg0-$name" "has staged changes"
+  g -C "$dir" reset -q -- "$tf"
+
+  snap "stg-$name"
+  g -C "$dir" add -- "$tf"
+  expect_fail "$name: change staged after snapshot fails" "stg-$name" "has staged changes"
+  g -C "$dir" reset -q -- "$tf"
+  expect_pass "$name: passes after the change is unstaged" "stg-$name"
+
+  # Same porcelain code (' M'), different worktree content.
+  snap "mod-$name"
+  cp -p -- "$dir/$tf" "$ATTIC/tf-$name.orig"
+  printf 'other content\n' > "$dir/$tf"
+  expect_fail "$name: tracked content change with the same status fails" "mod-$name" \
+    "$name tree changed since snapshot (tracked diff)"
+  cp -p -- "$ATTIC/tf-$name.orig" "$dir/$tf"
+  expect_pass "$name: passes after the tracked content is restored" "mod-$name"
+
+  for flag in assume-unchanged skip-worktree; do
+    g -C "$dir" update-index "--$flag" -- "$cf"
+    snap_refused "$name: snapshot refuses the $flag flag" "f0-$flag-$name" "skip-worktree or unmerged"
+    g -C "$dir" update-index "--no-$flag" -- "$cf"
+    snap "f-$flag-$name"
+    g -C "$dir" update-index "--$flag" -- "$cf"
+    expect_fail "$name: $flag set after snapshot fails" "f-$flag-$name" "skip-worktree or unmerged"
+    g -C "$dir" update-index "--no-$flag" -- "$cf"
+    expect_pass "$name: passes after $flag is cleared" "f-$flag-$name"
+  done
+
+  # HEAD binding: a commit that changes no tree content still fails.
+  snap "head-$name"
+  g -C "$dir" commit -q --allow-empty -m advance
+  expect_fail "$name: clean HEAD advance after snapshot fails" "head-$name" \
+    "$name HEAD changed since snapshot"
+  g -C "$dir" reset -q --soft HEAD~1
+  expect_pass "$name: passes after HEAD is restored" "head-$name"
+
+  snap "ht-$name"
+  sed -i "s/^$name [0-9a-f]*\$/$name $(printf '%040d' 0)/" "$R/out/ht-$name/heads"
+  expect_fail "$name: heads tamper fails SHA256SUMS" "ht-$name" "SHA256SUMS check failed"
+  resum "$R/out/ht-$name"
+  expect_fail "$name: heads tamper with rewritten SHA256SUMS fails" "ht-$name" \
+    "$name HEAD changed since snapshot"
 done
+
+# heads with an extra line and rewritten SHA256SUMS.
+snap hx
+printf 'extra\n' >> "$R/out/hx/heads"
+resum "$R/out/hx"
+expect_fail "malformed heads with rewritten SHA256SUMS fails" hx "heads is malformed"
+snap hm
+grep -v ' heads$' "$R/out/hm/SHA256SUMS" > "$ATTIC/SHA256SUMS-hm"
+cp -- "$ATTIC/SHA256SUMS-hm" "$R/out/hm/SHA256SUMS"
+expect_fail "heads missing from SHA256SUMS fails" hm "does not list exactly"
 
 # Untracked symlinks are refused and never followed.
 ln -s /etc/hostname "$P/link.txt"
@@ -311,6 +385,17 @@ g -C "$P" status --porcelain > "$R/out/legacy/pdfium.status"
 expect_fail "legacy snapshot is refused with a migration message" legacy "legacy snapshot"
 grep -qF "Migrate by taking a new snapshot" "$R/last.err" &&
   ok "legacy refusal names the migration" || bad "legacy refusal names the migration"
+
+# A snapshot/2 (no heads) is refused, not upgraded.
+mkdir "$R/out/v2"
+( cd "$R/out/base" && cp -- pdfium.js pdfium.wasm exported-functions.txt exported-runtime-methods.txt \
+    libembedpdf.a engine.diff pdfium.diff engine.status pdfium.status engine.untracked \
+    pdfium.untracked "$R/out/v2/" )
+printf 'editor-wasm-build-snapshot/2\nout_name=wasm\n' > "$R/out/v2/snapshot.format"
+( cd "$R/out/v2" && sha256sum pdfium.js pdfium.wasm exported-functions.txt exported-runtime-methods.txt \
+    libembedpdf.a engine.diff pdfium.diff engine.status pdfium.status engine.untracked \
+    pdfium.untracked snapshot.format > SHA256SUMS )
+expect_fail "snapshot/2 without heads is refused" v2 "is not editor-wasm-build-snapshot/3"
 
 # The snapshot binds its OUT_NAME.
 expect_fail "OUT_NAME mismatch fails" base "out_name=other" OUT_NAME=other

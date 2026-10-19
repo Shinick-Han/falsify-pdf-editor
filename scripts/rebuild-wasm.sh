@@ -28,7 +28,8 @@
 #   link        em++ ESM link -> build/wasm/pdfium.{js,wasm}
 #   snapshot    copy outputs to a new $BUILD_ROOT/out/$SNAPSHOT and, if set,
 #               to CANDIDATE_DIR (new or empty apart from package.json), with
-#               source diffs, git status and untracked file inventories
+#               both HEADs, source diffs, git status and untracked file
+#               inventories; refused while either index differs from HEAD
 #   provenance  write $BUILD_ROOT/out/$SNAPSHOT/provenance.json for an existing
 #               snapshot that still matches build/wasm and both source trees:
 #               pins, diffs, status, untracked files, patches verified as
@@ -114,8 +115,8 @@ WS_FILES=(all.h ast.json exported-functions.txt exported-runtime-methods.txt
 # Files of a snapshot, listed in its SHA256SUMS in exactly this order.
 SNAPSHOT_FILES=(pdfium.js pdfium.wasm exported-functions.txt exported-runtime-methods.txt
                 libembedpdf.a engine.diff pdfium.diff engine.status pdfium.status
-                engine.untracked pdfium.untracked snapshot.format)
-SNAPSHOT_FORMAT=editor-wasm-build-snapshot/2
+                engine.untracked pdfium.untracked snapshot.format heads)
+SNAPSHOT_FORMAT=editor-wasm-build-snapshot/3
 
 for d in "$TOOLS" "$BUILD_ROOT/src" "$BUILD_ROOT/cache" "$BUILD_ROOT/logs" "$BUILD_ROOT/out"; do
   real_dir "$d"
@@ -407,6 +408,38 @@ untracked_inventory() {
   printf '%s' "$out"
 }
 
+# index_matches_head REPO: the index of REPO holds exactly HEAD's tracked
+# content. git diff --binary compares the worktree with the index only, so a
+# staged change would be bound by neither the diff nor (when its porcelain
+# code stays the same) the status; it is refused rather than recorded. So are
+# assume-unchanged, skip-worktree and unmerged entries (git ls-files -v tag
+# other than H), whose worktree changes diff and status do not show.
+index_matches_head() {
+  local __v
+  out_of __v git -C "$1" diff --cached --name-only --no-renames --ignore-submodules=none HEAD --
+  [[ -z $__v ]] ||
+    die "$1 has staged changes; unstage them (git -C $1 reset -q) before snapshot or provenance"
+  out_of __v git -C "$1" ls-files -v
+  [[ $'\n'$__v != *$'\n'[!H]* && $'\n'$__v != *$'\n'H[!\ ]* ]] ||
+    die "$1 has assume-unchanged, skip-worktree or unmerged index entries (git ls-files -v); clear them before snapshot or provenance"
+}
+
+heads_text() { printf 'engine %s\npdfium %s\n' "$1" "$2"; }
+
+# check_heads DEST: both HEADs are still the ones recorded in DEST/heads and
+# both indexes still match HEAD.
+check_heads() {
+  local __e __p
+  rev_of __e "$ENGINE"
+  rev_of __p "$SRC"
+  index_matches_head "$ENGINE"
+  index_matches_head "$SRC"
+  [[ -f $1/heads && ! -L $1/heads ]] || die "$1/heads is not a regular file"
+  grep -qxF "engine $__e" "$1/heads" || die "engine HEAD changed since snapshot (now $__e)"
+  grep -qxF "pdfium $__p" "$1/heads" || die "pdfium HEAD changed since snapshot (now $__p)"
+  heads_text "$__e" "$__p" | cmp -s - "$1/heads" || die "$1/heads is malformed"
+}
+
 snapshot_format_text() { printf '%s\nout_name=%s\n' "$SNAPSHOT_FORMAT" "$OUT_NAME"; }
 
 # guard_candidate_dir: CANDIDATE_DIR is new, or a real directory that holds
@@ -437,9 +470,11 @@ stage_snapshot() {
   local dest=$BUILD_ROOT/out/$SNAPSHOT
   [[ ! -e $dest && ! -L $dest ]] || die "$dest already exists; choose a new SNAPSHOT"
   # Read the source state before anything is created.
-  local rev e_status p_status e_inv p_inv
-  rev_of rev "$ENGINE"
-  rev_of rev "$SRC"
+  local e_rev p_rev e_status p_status e_inv p_inv
+  rev_of e_rev "$ENGINE"
+  rev_of p_rev "$SRC"
+  index_matches_head "$ENGINE"
+  index_matches_head "$SRC"
   git_status e_status "$ENGINE"
   git_status p_status "$SRC"
   e_inv=$(untracked_inventory "$ENGINE") || die "untracked inventory failed in $ENGINE"
@@ -454,6 +489,10 @@ stage_snapshot() {
   printf '%s' "$e_inv" > "$dest/engine.untracked"
   printf '%s' "$p_inv" > "$dest/pdfium.untracked"
   snapshot_format_text > "$dest/snapshot.format"
+  heads_text "$e_rev" "$p_rev" > "$dest/heads"
+  # The diffs above are relative to these HEADs and indexes; refuse to seal a
+  # snapshot whose HEAD or index moved while it was written.
+  check_heads "$dest"
   ( cd "$dest" && sha256sum -- "${SNAPSHOT_FILES[@]}" | tee SHA256SUMS )
   if [[ -n $CANDIDATE_DIR ]]; then
     mkdir -p -- "$CANDIDATE_DIR"
@@ -480,7 +519,7 @@ stage_provenance() {
   [[ -f $dest/snapshot.format && ! -L $dest/snapshot.format ]] ||
     die "$dest is a legacy snapshot without git status or untracked inventory; it cannot get a $SNAPSHOT_FORMAT provenance record. Migrate by taking a new snapshot (SNAPSHOT=<new name> $0 snapshot) and describing that; existing records stay unchanged"
   snapshot_format_text | cmp -s - "$dest/snapshot.format" ||
-    die "$dest/snapshot.format is not $SNAPSHOT_FORMAT with out_name=$OUT_NAME"
+    die "$dest/snapshot.format is not $SNAPSHOT_FORMAT with out_name=$OUT_NAME (a snapshot of an earlier format cannot be described: take a new snapshot under a new name)"
   out_of v cut -c67- -- "$dest/SHA256SUMS"
   [[ $v == "$(printf '%s\n' "${SNAPSHOT_FILES[@]}")" ]] ||
     die "$dest/SHA256SUMS does not list exactly the snapshot files"
@@ -489,6 +528,10 @@ stage_provenance() {
     cmp -s "$dest/$f" "$WS/$f" || die "$dest/$f differs from $WS/$f; snapshot is stale"
   done
   cmp -s "$dest/libembedpdf.a" "$OUT/obj/libembedpdf.a" || die "$dest/libembedpdf.a differs from $OUT"
+  # HEADs and indexes first: the diff, status and inventory comparisons below
+  # are only meaningful against the snapshot's HEADs with indexes equal to
+  # HEAD. The commits recorded below are therefore the snapshot's HEADs.
+  check_heads "$dest"
   local e_rev p_rev live snap name repo_dir
   rev_of e_rev "$ENGINE"
   rev_of p_rev "$SRC"
@@ -511,7 +554,7 @@ stage_provenance() {
     [[ -n $2 ]] || die "empty provenance value: $1"
     rec+=$(printf '%s\t%s' "$1" "${2//$'\t'/ }")$'\n'
   }
-  kv schema editor-wasm-build-provenance/2
+  kv schema editor-wasm-build-provenance/3
   cap v date -u +%FT%TZ; kv created_utc "$v"
   kv snapshot "$SNAPSHOT"
   kv snapshot_format "$SNAPSHOT_FORMAT"
@@ -529,7 +572,9 @@ stage_provenance() {
     for f in diff status untracked; do
       sha_of v "$dest/$name.$f"; kv "$name/${f}_sha256" "$v"
     done
+    kv "$name/index" "equal to HEAD; no assume-unchanged, skip-worktree or unmerged entries"
   done
+  sha_of v "$dest/heads"; kv heads_sha256 "$v"
   local p
   for p in security-fixes editcore-pdfium brotli-decode; do
     git -C "$SRC" apply --reverse --check "$PDFIUM/build/patch/$p.patch" >/dev/null 2>&1 ||
@@ -565,6 +610,9 @@ stage_provenance() {
     kv "artifacts/$f/bytes" "$v"
   done
   kv scope "state of this build root when the snapshot was described; not an independent or clean-room build"
+  # Last check before the record is written: neither HEAD nor index moved
+  # while the values above were read.
+  check_heads "$dest"
   printf '%s' "$rec" | python3 -c '
 import json, sys
 doc = {}
@@ -612,7 +660,7 @@ stage_inventory() {
   cat "$inv/tools.txt"
 }
 
-[[ $# -gt 0 ]] || { sed -n '2,43p' "$0"; exit 2; }
+[[ $# -gt 0 ]] || { sed -n '2,44p' "$0"; exit 2; }
 for stage in "$@"; do
   case $stage in
     fetch|toolchain|sync|prepare|patch|configure|lib|exports|link|snapshot|provenance|inventory) ;;
