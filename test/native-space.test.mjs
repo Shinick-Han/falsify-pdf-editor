@@ -9,6 +9,10 @@
 // (identity branch only) are transcribed from layout.cpp, not extracted.
 // emitOverride stands in for an edited piece resolved to another font.
 // Real text-object emission, fonts and line breaking need the rebuilt WASM.
+// patches/editcore-justified-space.patch applies on top of it and changes only
+// the space-token width under word spacing; its post-image expression is
+// compiled the same way (namespace just) and compared with the natural-space
+// post-image (namespace post).
 // Skipped when no host C++ compiler (g++, `wsl.exe -e g++` or MSVC) is found.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -18,8 +22,10 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 const PATCH = new URL("../patches/editcore-natural-space.patch", import.meta.url);
+const JUSTIFIED_PATCH = new URL("../patches/editcore-justified-space.patch", import.meta.url);
 const DIR = "packages/pdfium/build/code/editcore/";
 const text = readFileSync(PATCH, "utf8");
+const justText = readFileSync(JUSTIFIED_PATCH, "utf8");
 
 function images(diff) {
   const files = {};
@@ -55,6 +61,8 @@ function slice(lines, start, end) {
 const files = images(text);
 const session = files[DIR + "session.cpp"];
 const layout = files[DIR + "layout.cpp"];
+const justFiles = images(justText);
+const justLayout = justFiles[DIR + "layout.cpp"];
 
 test("patch touches only editcore layout.cpp and session.cpp, LF", () => {
   assert.deepEqual(Object.keys(files).sort(), [DIR + "layout.cpp", DIR + "session.cpp"]);
@@ -64,6 +72,15 @@ test("patch touches only editcore layout.cpp and session.cpp, LF", () => {
   // The only removed lines are the old cut rule and the old space fallback.
   assert.deepEqual(session.removed.map((l) => l.trim()), ["if (at + len < src.text.size()) out.back() = -1.0f;"]);
   assert.deepEqual(layout.removed.map((l) => l.trim()), [": advanceOf(static_cast<int>(ri), u' ');"]);
+});
+
+test("justified-space patch replaces only the natural-space space-token width, LF", () => {
+  assert.deepEqual(Object.keys(justFiles), [DIR + "layout.cpp"]);
+  assert.ok(!justText.includes("\r"), "patch must be LF");
+  // It applies to the natural-space post-image: what it removes is exactly
+  // that patch's space-token expression.
+  const old = slice(layout.post, "const bool naturalOk", "u' ');").split("\n").map((l) => l.trim());
+  assert.deepEqual(justLayout.removed.map((l) => l.trim()), old);
 });
 
 const LAYOUT = (name, prepass, expr) => `
@@ -91,6 +108,7 @@ ${prepass}
   bool anyEdited = false;
   for (const auto& r : layoutRuns) if (!r.textUnchanged || !r.originalFont) anyEdited = true;
   std::vector<float> adv;
+  std::vector<Token> tokens;
   for (size_t ri = 0; ri < layoutRuns.size(); ri++) {
     const std::u16string& text = layoutRuns[ri].text;
     const std::vector<float>* sa =
@@ -101,11 +119,14 @@ ${prepass}
       const float ov = sa ? (*sa)[ci] : -1.0f;
       if (cp == u' ') {
         Token t;
+        t.kind = Token::Space;
         const bool atomicNbr = false;
 ${expr}
         adv.push_back(t.width);
+        tokens.push_back(t);
       } else {
         adv.push_back(ov >= 0 ? ov : advanceOf(static_cast<int>(ri), cp));
+        tokens.push_back(Token());
       }
     }
   }
@@ -144,7 +165,7 @@ struct ParaRun {
 struct ResolvedRun { FPDF_FONT font; float emitSize; float hScale; bool complex; };
 struct Fmt { float word_spacing = 0; };
 struct Para { Fmt fmt; };
-struct Token { float width = 0; };
+struct Token { enum Kind { Word, Space } kind = Word; float width = 0; };
 static FPDF_FONT emitOverride = nullptr;
 
 namespace post {
@@ -154,6 +175,11 @@ ${slice(layout.post, "struct SpaceSampleRun {")}
 ${slice(layout.post, "std::vector<float> sourceNaturalSpaces(")}
 ${LAYOUT("post", slice(layout.post, "std::vector<float> naturalSpace;", "naturalSpace[ri] = -1.0f;") + "\n    }\n  }",
   slice(layout.post, "const bool naturalOk", "u' ');"))}
+}
+namespace just {
+using namespace post;
+${LAYOUT("just", slice(layout.post, "std::vector<float> naturalSpace;", "naturalSpace[ri] = -1.0f;") + "\n    }\n  }",
+  slice(justLayout.post, "const bool naturalOk", "(naturalOk && afterWord ? base : 0.0f);"))}
 }
 namespace pre {
 ${slice(session.pre, "std::vector<float> sliceSrcAdvAt(")}
@@ -203,7 +229,8 @@ static std::vector<float> gaps(const std::string& s, const std::vector<float>& a
 }
 int main() {
   for (char c = 'a'; c <= 'z'; c++) tex.w[static_cast<uint32_t>(c)] = 400.0f + 10.0f * (c - 'a');
-  tex.w[u'.'] = 250.0f; tex.w[u'R'] = 667.0f; tex.w[u'F'] = 556.0f;
+  tex.w[u'.'] = 250.0f; tex.w[u','] = 250.0f; tex.w[u':'] = 278.0f;
+  tex.w[u'R'] = 667.0f; tex.w[u'F'] = 556.0f;
   texalt = texsp = tex; texsp.w[u' '] = 333.0f;
   std::string line;
   while (std::getline(std::cin, line)) {
@@ -226,10 +253,13 @@ int main() {
       pre::appendEditedRun(a, r, src);
       post::appendEditedRun(b, r, src);
       const std::vector<float> pa = pre::layout_pre(a, ws), pb = post::layout_post(b, ws);
+      const std::vector<float> pj = just::layout_just(b, ws);
       std::printf("{\\"pre\\":{\\"gaps\\":"); list(gaps(after, pa));
       std::printf(",\\"adv\\":"); list(pa);
       std::printf("},\\"post\\":{\\"gaps\\":"); list(gaps(after, pb));
       std::printf(",\\"adv\\":"); list(pb);
+      std::printf("},\\"just\\":{\\"gaps\\":"); list(gaps(after, pj));
+      std::printf(",\\"adv\\":"); list(pj);
       std::printf("}}\\n");
     } else if (cmd == "slice") {
       size_t at, len; in >> at >> len; in.get();
@@ -414,4 +444,75 @@ test("an edited piece resolved to another font does not borrow the source font's
   // piece in texalt: the existing font measurement (0.5 em fallback).
   close(post.gaps, [NATURAL, NATURAL, NATURAL, FALLBACK, FALLBACK, FALLBACK], "swapped font");
   close(pre.gaps, [NATURAL, NATURAL, NATURAL + FALLBACK, FALLBACK, FALLBACK, FALLBACK], "unpatched");
+});
+
+// rebrac-short-01 shape: a justified line re-justified by word spacing after a
+// shorter replacement; Tw as solved for it (negative against the 0.5 em
+// space fallback).
+const SHORT = "is expensive or unsafe, but it makes policy improvement brittle:";
+const SHORT_AFTER = "is costly or unsafe, but it makes policy improvement brittle:";
+
+test("justified: under Tw the gap after an edited word keeps the source natural gap", (t) => {
+  const out = run([`edit -3.08 ${SHORT}|${SHORT_AFTER}`, "edit 1.2 the cat sat on the mat.|the dog sat on the mat."]);
+  if (!out) return t.skip("no host C++ compiler");
+  const [short, cat] = out;
+  const x = (tw) => NATURAL + FALLBACK + tw;
+  // Before: the edited/kept boundary lacks the gap kept glyphs carry folded.
+  close(short.post.gaps, [x(-3.08), FALLBACK - 3.08].concat(Array(7).fill(x(-3.08))), "natural-space only");
+  close(short.just.gaps, Array(9).fill(x(-3.08)), "justified");
+  close(cat.post.gaps, [x(1.2), FALLBACK + 1.2, x(1.2), x(1.2), x(1.2)], "cat natural-space only");
+  close(cat.just.gaps, Array(5).fill(x(1.2)), "cat justified");
+  // Glyph advances (and so source kerning) are untouched; each space token
+  // still grows by exactly Tw, which the line-local width solve relies on.
+  for (let i = 0; i < SHORT_AFTER.length; i++)
+    if (SHORT_AFTER[i] !== " ") assert.equal(short.just.adv[i], short.post.adv[i], `glyph ${i}`);
+});
+
+test("justified: Tw on both sides of the edit and on inserted spaces, positive and negative", (t) => {
+  const after = "the distribution shift that this improvement induces.";
+  const out = run([`edit 1.5 ${LINE}|${after}`, `edit -0.8 ${LINE}|${after}`]);
+  if (!out) return t.skip("no host C++ compiler");
+  for (const [k, { post, just }] of out.entries()) {
+    const tw = k === 0 ? 1.5 : -0.8;
+    close(post.gaps, Array(3).fill(NATURAL + FALLBACK + tw).concat(Array(3).fill(FALLBACK + tw)), `before ${tw}`);
+    close(just.gaps, Array(6).fill(NATURAL + FALLBACK + tw), `justified ${tw}`);
+  }
+});
+
+test("justified: explicit multiple spaces under Tw stay that many full spaces", (t) => {
+  const out = run([`edit 1.5 ${LINE}|the distribution shift that  this improvement   induces.`]);
+  if (!out) return t.skip("no host C++ compiler");
+  const [{ just }] = out;
+  close(just.gaps, [1, 1, 1, 2, 1, 3].map((k) => k * (NATURAL + FALLBACK + 1.5)), "multi");
+});
+
+test("justified: zero Tw, a measured space glyph, another font and no evidence keep the natural-space result", (t) => {
+  const after = "the distribution shift that this improvement induces.";
+  const out = run([
+    `edit 0 ${LINE}|${after}`,
+    `edit 0 ${LINE}|the distribution shift that  this improvement   induces.`,
+    "edit 0 the cat sat on the mat.|the dog sat on the mat.",
+    `edit 0 ${SHORT}|${SHORT_AFTER}`,
+    `editx space 1.5 ${LINE}|${after}`,
+    `editx space -0.8 ${LINE}|${after}`,
+    `editx swap 1.5 ${LINE}|${after}`,
+    "edit 1.5 Results.|Final results here.",
+  ]);
+  if (!out) return t.skip("no host C++ compiler");
+  for (const [k, { post, just }] of out.entries()) assert.deepEqual(just, post, `case ${k}`);
+  // The measured space glyph (texsp): font width plus Tw everywhere.
+  close(out[4].just.gaps, Array(6).fill(SPACE_GLYPH + 1.5), "space glyph tw");
+  // Edited piece in texalt: kept prefix natural gaps, edited piece the
+  // font fallback, as before.
+  close(out[6].just.gaps, Array(3).fill(NATURAL + FALLBACK + 1.5).concat(Array(3).fill(FALLBACK + 1.5)), "swap tw");
+  close(out[7].just.gaps, [FALLBACK + 1.5, FALLBACK + 1.5], "no evidence tw");
+});
+
+test("justified: leading (indent) spaces under Tw keep the font measurement", (t) => {
+  const out = run(["edit 1.5   the cat sat on the mat.|  the dog sat on the mat."]);
+  if (!out) return t.skip("no host C++ compiler");
+  const [{ post, just }] = out;
+  assert.deepEqual(just.adv.slice(0, 2), post.adv.slice(0, 2));
+  close(just.adv.slice(0, 2), [FALLBACK + 1.5, FALLBACK + 1.5], "indent");
+  close(just.gaps, Array(5).fill(NATURAL + FALLBACK + 1.5), "interword");
 });
