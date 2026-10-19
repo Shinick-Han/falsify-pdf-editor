@@ -17,9 +17,9 @@ general-purpose PDF editor and not a production-quality guarantee (see [README](
 
 ## Evidence and its limits
 
-- Repeated same-line edits succeeded on the calibration documents in two and three successive edit generations.
+- Repeated same-line edits succeeded on one fixed ReBRAC calibration case through edit generations two and three.
   Source-structure and preservation warnings still occur and are reported; they are not hidden.
-- Three AMAS documents remain refusals at this boundary. No claim is made for arbitrary PDFs, AMAS documents,
+- Three edit cases on one AMAS paper remain refused or unsupported at this boundary. No claim is made for arbitrary PDFs, AMAS documents,
   invisible/undetectable editing or scientific/model performance.
 - The locally built runtime (WASM digest prefix `9b14`, candidate manifest prefix `5910`) was verified on the
   maintainer host only: `sourceBuildVerified=false`, same-host incremental build. It is not a reproducible or
