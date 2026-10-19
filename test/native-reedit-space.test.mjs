@@ -401,6 +401,23 @@ int main() {
       emitOverride = nullptr;
       std::printf("{\\"adv\\":"); list(fix::layout_fix({r}, ws, srcWs, true));
       std::printf("}\\n");
+    } else if (cmd == "atomic") {
+      // atomic WS SRCWS text|a0,...|text|a0,...: two kept runs with an
+      // atomic object between them.
+      float ws, srcWs; in >> ws >> srcWs; in.get();
+      std::string rest; std::getline(in, rest);
+      const std::vector<std::string> parts = split(rest, '|');
+      std::vector<ParaRun> runs(3);
+      static FakeObj atom;
+      runs[1].atomicObject = &atom;
+      for (size_t k : {0, 2}) {
+        ParaRun& r = runs[k];
+        r.text = u16(parts[k]); r.style.size = SIZE; r.originalFont = &tex; r.textUnchanged = true;
+        for (const std::string& a : split(parts[k + 1], ',')) r.srcAdv.push_back(std::stof(a));
+      }
+      emitOverride = nullptr;
+      std::printf("{\\"adv\\":"); list(fix::layout_fix(runs, ws, srcWs, true));
+      std::printf("}\\n");
     } else if (cmd == "ecfmt") {
       // ecfmt text#mark#mark...: one text object per mark; a mark is
       // NAME:f-string, NAME! (no f) or NAME; {h} is the paragraph's hash.
@@ -666,6 +683,46 @@ test("unknown or non-finite source word spacing: no source advance is used", (t)
   close(out[2].steps[1].gaps, fill(9, FALLBACK + WS1), "measured");
 });
 
+test("unknown or non-finite source word spacing at requested ws 0 keeps the fa2411 source advances", (t) => {
+  const lines = [];
+  for (const ws of ["0", "0.004"])
+    for (const shape of ["f", "s"])
+      for (const mode of ["unknown", "nan", "base"])
+        lines.push(`chain ${mode} ${shape} 1 tex ${PAPER}|${GEN1}|${WS1}|${GEN2}|${ws}`);
+  const out = run(lines);
+  if (!out) return t.skip("no host C++ compiler");
+  for (let k = 0; k < out.length; k += 3) {
+    assert.deepEqual(out[k], out[k + 2], lines[k]);
+    assert.deepEqual(out[k + 1], out[k + 2], lines[k + 1]);
+    // The drawn gaps and kerning, not the 0.5 em fallback.
+    close(out[k].steps[1].gaps, fill(9, NATURAL + FALLBACK + WS1), lines[k]);
+  }
+});
+
+// costly -> cheap shares no word ending: the kept suffix starts at a space.
+const CHEAP = "is cheap or unsafe, but it makes policy improvement brittle:";
+const MULTI2 = "the distribution shift that  this gain   induces.";
+
+test("a kept suffix starting at a space after an edit gives the source measure back", (t) => {
+  const lines = [];
+  for (const ws of [WS1, -2, 1.5, 0]) for (const shape of ["f", "s"])
+    lines.push(`chain fix ${shape} 1 tex ${PAPER}|${GEN1}|${WS1}|${CHEAP}|${ws}`);
+  for (const ws of [1.5, -0.8, 0]) for (const shape of ["f", "s"])
+    lines.push(`chain fix ${shape} 1 tex ${LINE}|${MULTI}|1.5|${MULTI2}|${ws}`);
+  const out = run(lines);
+  if (!out) return t.skip("no host C++ compiler");
+  let i = 0;
+  for (const ws of [WS1, -2, 1.5, 0]) for (const shape of ["f", "s"]) {
+    const want = ws === 0 ? NATURAL : NATURAL + FALLBACK + ws;
+    close(out[i++].steps[1].gaps, fill(9, want), `cheap ws ${ws} ${shape}`);
+  }
+  const k = [1, 1, 1, 2, 1, 3];
+  for (const ws of [1.5, -0.8, 0]) for (const shape of ["f", "s"]) {
+    const want = ws === 0 ? NATURAL : NATURAL + FALLBACK + ws;
+    close(out[i++].steps[1].gaps, k.map((n) => n * want), `multiple spaces ws ${ws} ${shape}`);
+  }
+});
+
 test("space groups that cannot be split safely are measured; uncaptured line ends untouched", (t) => {
   const own = (c) => (400 + 10 * (c.charCodeAt(0) - 97)) * SIZE / 1000;
   const S = FALLBACK - 3;
@@ -702,6 +759,25 @@ test("space groups that cannot be split safely are measured; uncaptured line end
   near(onSpace[2], S + 1.2, "on space");
   near(partial[1], b + 0.5, "partial fold");
   close(indent.slice(3, 5), [S, S], "indent after a line break");
+});
+
+test("a space group right after an atomic object gives the source measure back from a positive advance", (t) => {
+  const own = (c) => (400 + 10 * (c.charCodeAt(0) - 97)) * SIZE / 1000;
+  const S = FALLBACK - 3;
+  const a = own("a"), b = own("b"), c = own("c"), d = own("d");
+  const out = run([
+    `atomic 0 -3 ab|${a},${b}| cd|${1.2 + S},${c},${d}`,
+    `atomic 0 -3 ab|${a},${b}|  cd|${0.5 * (1.2 + 2 * S)},${0.5 * (1.2 + 2 * S)},${c},${d}`,
+    // Nothing on the space, or no source word spacing: kept as captured.
+    `atomic 0 -3 ab|${a},${b}| cd|0,${c},${d}`,
+    `atomic 0 0 ab|${a},${b}| cd|${1.2 + S},${c},${d}`,
+  ]);
+  if (!out) return t.skip("no host C++ compiler");
+  const [one, two, zero, unbound] = out.map((o) => o.adv);
+  close(one, [a, b, 1.2, c, d], "one space");
+  close(two, [a, b, 0.6, 0.6, c, d], "two spaces");
+  close(zero, [a, b, 0, c, d], "zero");
+  close(unbound, [a, b, 1.2 + S, c, d], "source ws 0");
 });
 
 test("/ECFmt binding: the matching mark binds ws; any other nonzero or unreadable mark makes it unknown", (t) => {

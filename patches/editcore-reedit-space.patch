@@ -172,10 +172,10 @@ index b752d02d..03e884e1 100644
          switch (((pageRot % 360) + 360) % 360) {
              case 90:  *ux = -dy; *uy = dx;  return;
 diff --git a/packages/pdfium/build/code/editcore/layout.cpp b/packages/pdfium/build/code/editcore/layout.cpp
-index a90322a3..b9a6640c 100644
+index a90322a3..fcb81d70 100644
 --- a/packages/pdfium/build/code/editcore/layout.cpp
 +++ b/packages/pdfium/build/code/editcore/layout.cpp
-@@ -1412,251 +1412,373 @@ bool layoutParagraph(Session& s, FPDF_PAGE page, Paragraph& p, bool autoWiden,
+@@ -1412,251 +1412,386 @@ bool layoutParagraph(Session& s, FPDF_PAGE page, Paragraph& p, bool autoWiden,
          return ratio > 0.97f && ratio < 1.03f;
      };
  
@@ -257,11 +257,14 @@ index a90322a3..b9a6640c 100644
  
      int srcAdvUsed = 0;
 +    // Source advances are only usable under the spacing they were captured
-+    // with; an unattributable source word spacing makes them unusable.
++    // with. An unattributable source word spacing makes them unusable under
++    // a requested word spacing; at none they are used raw, as before the
++    // source word spacing was bound (never normalised by a guessed value).
      const bool srcAdvOk =
 -        std::abs(p.fmt.char_spacing - p.srcCharSpacing) < 0.005f;
 +        std::abs(p.fmt.char_spacing - p.srcCharSpacing) < 0.005f &&
-+        p.srcWordSpacingKnown && std::isfinite(p.srcWordSpacing);
++        ((p.srcWordSpacingKnown && std::isfinite(p.srcWordSpacing)) ||
++         std::abs(p.fmt.word_spacing) < 0.005f);
 +
 +    // Source advances emitted by the editor under nonzero word spacing carry,
 +    // for every space, its measure at emission (glyphAdvance(' ') + Tc + Tw,
@@ -280,7 +283,9 @@ index a90322a3..b9a6640c 100644
 +            const ParaRun& lr = layoutRuns[ri];
 +            srcAdvN[ri] = lr.srcAdv;
 +            float w = 0;
-+            if (!srcAdvOk || std::abs(p.srcWordSpacing) < 0.005f ||
++            if (!srcAdvOk || !p.srcWordSpacingKnown ||
++                !std::isfinite(p.srcWordSpacing) ||
++                std::abs(p.srcWordSpacing) < 0.005f ||
 +                lr.atomicObject || resolved[ri].complex ||
 +                !lr.originalFont || resolved[ri].font != lr.originalFont ||
 +                lr.srcAdv.size() != lr.text.size() ||
@@ -310,14 +315,18 @@ index a90322a3..b9a6640c 100644
 +        auto put = [&](size_t j, float v) {
 +            if (norm[at[j].first]) srcAdvN[at[j].first][at[j].second] = v;
 +        };
++        // A segment after an atomic object starts between words: its leading
++        // space group follows the object, not a glyph.
++        bool afterAtomic = false;
 +        auto flush = [&]() {
 +            const size_t n = at.size();
-+            for (size_t k = 1; k < n; k++) {
-+                if (ch(k) != u' ' || ch(k - 1) == u' ') continue;
++            for (size_t k = afterAtomic ? 0 : 1; k < n; k++) {
++                const bool lead = k == 0;
++                if (ch(k) != u' ' || (!lead && ch(k - 1) == u' ')) continue;
 +                size_t e = k;
 +                while (e < n && ch(e) == u' ') e++;
-+                const size_t pv = k - 1;
-+                const char16_t pc = ch(pv);
++                const size_t pv = lead ? k : k - 1;
++                const char16_t pc = lead ? char16_t(0xFFFC) : ch(pv);
 +                bool spacesNorm = true, anySpaceNorm = false, measured = false;
 +                bool nonNeg = true;
 +                float sum = 0, give = 0;
@@ -331,9 +340,11 @@ index a90322a3..b9a6640c 100644
 +                }
 +                // Not after a word (indent, line start), no normalised run
 +                // involved, or no captured advance on any of the spaces (a
-+                // cut line end): no source gap here to give back.
++                // cut line end): no source gap here to give back. After an
++                // atomic object only a positive advance on the spaces holds
++                // one.
 +                if (pc < 0x21 || (!norm[at[pv].first] && !anySpaceNorm) ||
-+                    !measured) {
++                    !measured || (lead && sum < 0.01f)) {
 +                    k = e - 1;
 +                    continue;
 +                }
@@ -344,7 +355,7 @@ index a90322a3..b9a6640c 100644
 +                const float pa = val(pv);
 +                float own = 0;
 +                const bool prevOk =
-+                    norm[at[pv].first] && pa > 0.0f &&
++                    !lead && norm[at[pv].first] && pa > 0.0f &&
 +                    !(pc >= 0xD800 && pc <= 0xDFFF) && pr.font &&
 +                    FPDFFont_GetGlyphWidth(pr.font, pc, pr.emitSize, &own) &&
 +                    std::isfinite(own) && own > 0.0f;
@@ -370,10 +381,12 @@ index a90322a3..b9a6640c 100644
 +                k = e - 1;
 +            }
 +            at.clear();
++            afterAtomic = false;
 +        };
 +        for (size_t ri = 0; ri < layoutRuns.size(); ri++) {
 +            if (layoutRuns[ri].atomicObject) {
 +                flush();
++                afterAtomic = true;
 +                continue;
 +            }
 +            for (size_t ci = 0; ci < layoutRuns[ri].text.size(); ci++)
