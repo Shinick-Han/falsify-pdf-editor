@@ -374,7 +374,10 @@ export async function editPdf(request, options = {}) {
           // Only a stepped commit (linePlan.breaks) can be undone here.
           const pre = linePlan?.breaks && localStable ? pageObjectList(engine) : null;
           committed = commitRetainingLines(engine, para, runs, linePlan);
-          const lost = committed.lines?.status === "reflowed" && committed.lines.reason !== "line_count_changed";
+          // Any plain re-layout lost the source lines, including one that
+          // changed the line count: commitLineLocal itself declines an edit
+          // that leaves its source line or does not fit it.
+          const lost = committed.lines?.status === "reflowed";
           if (lost && linePlan?.breaks && objectsBefore !== null && !localStable) lineLocal = { status: "declined", reason: "page_model_unstable" };
           // A re-layout that lost the source lines is replaced by a re-layout
           // of the edited line alone when the edit stays inside it.
