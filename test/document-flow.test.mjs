@@ -6,6 +6,8 @@ import { planDocumentLines } from '../src/document-flow.mjs';
 import { inspectSavedPdf, capturePageLayout, expectedPageText } from '../src/quality.mjs';
 import { deriveDocumentFlowBand, adjacentSourceRuns } from '../src/document-flow-band.mjs';
 import { deriveNativeLinkMoves, deriveNativeFitRMoves, readLinkPageCharacters } from '../src/document-flow-links.mjs';
+import { sourceUnderline } from '../src/document-flow-underlines.mjs';
+import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -258,8 +260,8 @@ async function annotatedFixture({underlines=false,variant='normal',denseAll=fals
  const bytes=flowFixture({pages:4,denseAll}),e=await runtime.engineFactory(bytes),descriptors=[];
  try{
   for(const [pageIndex,needle,last,edge]of [[0,'Theunchangedline17',true,false],[1,'Another',false,false],[1,'Synthetic',false,true]]){
-   const chars=readLinkPageCharacters(e,pageIndex).filter(c=>c.box&&(edge?c.box.b>740:c.box.b>80&&c.box.t<720)),raw=chars.map(c=>String.fromCharCode(c.u)).join(''),at=last?raw.lastIndexOf(needle):raw.indexOf(needle),label=chars.slice(at,at+(edge?9:3));
-   assert.ok(at>=0);descriptors.push({pageIndex,rect:[label[0].box.l+.1,Math.min(...label.map(c=>c.box.b)),label.at(-1).box.r-.1,Math.max(...label.map(c=>c.box.t))],edge});
+   const chars=readLinkPageCharacters(e,pageIndex).filter(c=>c.box&&(edge?c.box.b>740:c.box.b>80&&c.box.t<720)),raw=chars.map(c=>String.fromCharCode(c.u)).join(''),at=last?raw.lastIndexOf(needle):raw.indexOf(needle),label=chars.slice(at,at+(edge?9:variant==='longlabel'&&!last?needle.length:3));
+   assert.ok(at>=0);descriptors.push({pageIndex,rect:[label[0].box.l+.1,Math.min(...label.map(c=>c.box.b)),label.at(-1).box.r-.1+(variant==='oversized'&&last?100:0),Math.max(...label.map(c=>c.box.t))],edge});
   }
  }finally{e.close();}
  const {mupdf}=annotationRuntime,d=new mupdf.PDFDocument(bytes);
@@ -272,6 +274,11 @@ async function annotatedFixture({underlines=false,variant='normal',denseAll=fals
    try{text=new TextDecoder().decode(buffer.asUint8Array());}finally{buffer.destroy();}
    text=text.replace('(The unchanged line 17','(The) Tj ( unchanged line 17');
    contents.put(1,d.addStream(new TextEncoder().encode(text),{}));
+   if(variant==='longlabel'){
+    const other=pages[1].get('Contents'),buffer=other.get(1).readStream();let text;
+    try{text=new TextDecoder().decode(buffer.asUint8Array());}finally{buffer.destroy();}
+    other.put(1,d.addStream(new TextEncoder().encode(text.replace('(Another paragraph','(Another) Tj ( paragraph')),{}));
+   }
   }
   d.getTrailer().get('Root').put('Dests',{outsideTarget:[pages[targetPage],'XYZ',50,700,null]});
   for(const [i,{pageIndex,rect,edge}]of descriptors.entries()){
@@ -348,6 +355,21 @@ test('tiny supported link underlines clone with the exact glyph/link translation
  for(const variant of ['long','dash','duplicate','curve','clip','grid']){
   await assert.rejects(editPdf({sourceBytes:await annotatedFixture({underlines:true,variant}),edits,reflow:true},{documentFlow:true,engineFactory:runtime.engineFactory,annotationAdapter:annotationRuntime.adapter}),e=>e.code==='LAYOUT_UNSUPPORTED');
  }
+});
+test('long source-owned link underline moves, while an oversized link path is rejected',annotationsReal,async()=>{
+ const edits=[{id:'grow',pageIndex:0,before,after}];
+ const sourceBytes=await annotatedFixture({underlines:true,variant:'longlabel'});
+ const result=await editPdf({sourceBytes,edits,reflow:true},{documentFlow:true,engineFactory:runtime.engineFactory,annotationAdapter:annotationRuntime.adapter});
+ assert.equal(result.report.ok,true);assert.equal(result.report.selfCheck.annotationCheck.ok,true);
+ assert.ok(result.report.pagination.annotationMoves.some(m=>m.sourcePageIndex===1));
+ const oversized=await annotatedFixture({underlines:true,variant:'oversized'});
+ const model=await annotationRuntime.adapter.inspect({sourceBytes:oversized,sourceSha256:createHash('sha256').update(oversized).digest('hex')});
+ const engine=await runtime.engineFactory(oversized);
+ try{
+  engine.loadPage(0);const M=engine.M,h=Array.from({length:M._FPDFPage_CountObjects(engine.page)},(_,i)=>M._FPDFPage_GetObject(engine.page,i)).find(h=>M._FPDFPageObj_GetType(h)===2);
+  assert.throws(()=>sourceUnderline(engine,h,0,model),e=>e.code==='document_flow_underline_too_long');
+ }finally{engine.close();}
+ await assert.rejects(editPdf({sourceBytes:oversized,edits,reflow:true},{documentFlow:true,engineFactory:runtime.engineFactory,annotationAdapter:annotationRuntime.adapter}),e=>e.code==='LAYOUT_UNSUPPORTED');
 });
 test('internal target page stops an eligible text prefix and terminal tail preserves target identity and coordinates',annotationsReal,async()=>{
  const sourceBytes=await annotatedFixture({denseAll:true,targetPage:2}),edits=[{id:'grow',pageIndex:0,before,after}];
