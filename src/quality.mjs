@@ -18,6 +18,8 @@
 import { createHash } from "node:crypto";
 import { resolvePageFraction } from "./continuation-template.mjs";
 import { deriveDocumentFlowBand } from "./document-flow-band.mjs";
+import { deriveNativeLinkMoves, savedLinkGlyphs } from "./document-flow-links.mjs";
+import { verifySavedUnderlines } from "./document-flow-underlines.mjs";
 
 const TOL = 1;
 const EDGE_BAND = 0.1;
@@ -690,7 +692,7 @@ function extents(g) {
 }
 
 // Apply each edit once to the whitespace-normalized source page text.
-export function expectedPageText(sourceText, pageEdits) {
+export function expectedPageText(sourceText, pageEdits, options = {}) {
   const norm = normStr(sourceText);
   let matchText = "";
   const matchMap = [];
@@ -727,7 +729,7 @@ export function expectedPageText(sourceText, pageEdits) {
     out += norm.slice(at, s.a) + s.after;
     at = s.b;
   }
-  return { ok: true, text: normStr(out + norm.slice(at)) };
+  return { ok: true, text: normStr(out + norm.slice(at)), ...(options.includeSpans ? {spans:spans.map(s=>({...s}))} : {}) };
 }
 
 export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, edits, options = {}) {
@@ -752,7 +754,15 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
       if (!(p >= 0 && p < src.pageCount)) failures.push({ code: "edit_page_out_of_range", pageIndex: p });
     }
     const n = map && out.pageCount === expectedOut ? src.pageCount : map ? 0 : Math.min(src.pageCount, out.pageCount);
-    const grouped = inspectDocumentGroups(src, out, map, options.flowGroups ?? [], byPage, failures, warnings, !!options.includeText);
+    let annotationModel=null;
+    const annotationAdapter=options.annotationAdapter;
+    if(annotationAdapter&&(options.flowGroups?.length??0)>0){
+      if(!['inspect','transport','validate'].every(k=>typeof annotationAdapter[k]==='function'))throw new Error('document_flow_annotation_adapter_invalid');
+      annotationModel=await annotationAdapter.inspect({sourceBytes,sourceSha256:createHash('sha256').update(sourceBytes).digest('hex')});
+      if(!annotationModel||!Array.isArray(annotationModel.annotations))throw new Error('document_flow_annotation_inventory_mismatch');
+    }
+    const annotationMoves=[];
+    const grouped = inspectDocumentGroups(src, out, map, options.flowGroups ?? [], byPage, failures, warnings, !!options.includeText, annotationModel, annotationMoves);
     for (let i = 0; i < n; i++) {
       const m = map ? map[i] : { outputPageIndex: i, continuationPageIndices: [] };
       const s = readGlyphs(src, i);
@@ -808,6 +818,11 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
         else failures.push({ code: "edge_band_body_changed", pageIndex: i, count: split.bodyChanged });
       }
     }
+    if(annotationAdapter&&annotationModel){
+      const verified=await annotationAdapter.validate({model:annotationModel,sourceBytes,outputBytes,sourcePageMap:map,moves:annotationMoves,reflowedSourcePages:[...grouped.keys()]});
+      if(verified?.ok!==true)failures.push({code:typeof verified?.code==='string'&&/^[a-z_]{1,64}$/.test(verified.code)?verified.code:'document_flow_annotation_verification_failed'});
+      report.annotationCheck={ok:verified?.ok===true,moves:annotationMoves.length};
+    }
     report.ok = failures.length === 0;
     warnings.push({ code: "self_check_not_independent", detail: "same PDFium build; independent extraction and rendering review still required" });
   } catch (err) {
@@ -820,7 +835,7 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
   return report;
 }
 
-function inspectDocumentGroups(src, out, map, groups, byPage, failures, warnings, includeText) {
+function inspectDocumentGroups(src, out, map, groups, byPage, failures, warnings, includeText, annotationModel=null, annotationMoves=[]) {
   const covered=new Map(), outputs=new Set();
   const bad=()=>failures.push({code:'document_flow_map_invalid'});
   if(!Array.isArray(groups)||groups.length>64){bad();return covered;}
@@ -841,7 +856,7 @@ function inspectDocumentGroups(src, out, map, groups, byPage, failures, warnings
     // all source bands from immutable source bytes with the producer's same
     // classifier, then derive destination/tail bands from those results.
     let derived;
-    try {derived=ids.map(i=>deriveDocumentFlowBand(src,i,capturePageLayout));}
+    try {derived=ids.map(i=>deriveDocumentFlowBand(src,i,capturePageLayout,annotationModel));}
     catch {bad();continue;}
     const keys=['bodyTop','flowTop','floor','x0','x1'];
     const near=(a,b)=>Number.isFinite(a)&&Math.abs(a-b)<=1e-4;
@@ -851,6 +866,11 @@ function inspectDocumentGroups(src, out, map, groups, byPage, failures, warnings
         const destination=derived[Math.min(k,derived.length-1)];
         return ['bodyTop','flowTop','floor'].some(key=>!near(b[key],destination[key]))||!near(b.x0,expectedX0)||!near(b.x1,expectedX1);
       })) {bad();continue;}
+    try {
+      const moves=deriveNativeLinkMoves(src,derived,savedLinkGlyphs(out,oo),[...byPage.values()].flat(),annotationModel,expectedPageText);
+      annotationMoves.push(...moves);
+      verifySavedUnderlines(out,derived,oo,moves);
+    }catch(error){failures.push({code:error?.code??'document_flow_link_mapping_failed',pageIndex:ids[0]});}
     const source=ss.map(b=>readGlyphs(src,b.sourcePageIndex)),output=oo.map(b=>readGlyphs(out,b.outputPageIndex));
     const expected=[];let valid=true;
     for(let k=0;k<ss.length;k++){

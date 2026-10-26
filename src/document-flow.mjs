@@ -1,9 +1,12 @@
 // Bounded post-edit text-chain compaction. Objects are reconstructed with the
 // same document's fonts because existing PDFium objects retain foreign stream
 // indices when transferred. No rasterization, font scaling or text shortening.
-import { capturePageLayout } from './quality.mjs';
+import { createHash } from 'node:crypto';
+import { capturePageLayout, expectedPageText } from './quality.mjs';
 import { groupLines } from './pagination.mjs';
 import { deriveDocumentFlowBand, checkDocumentFlowPageBudget } from './document-flow-band.mjs';
+import { deriveNativeLinkMoves, plannedLinkGlyphs } from './document-flow-links.mjs';
+import { snapshotTinyUnderline, matchStagedUnderlines, cloneUnderline, underlineEqual } from './document-flow-underlines.mjs';
 import { snapshotTextObjects, cloneTextObject, verifyTextObject, snapshotPageEdges, applyPageEdges, verifyPageEdges } from './continuation-template.mjs';
 
 const fail = code => { throw Object.assign(new Error(code), {code}); };
@@ -41,35 +44,51 @@ function readPart(e, pageIndex, band, origin) {
     const b=e.objectBounds(h);if(!b)return false;
     const cy=b.y+b.h/2;return cy>=band.floor-.5&&cy<=band.bodyTop+.5;
   });
-  const snap=snapshotTextObjects(e,handles);if(!snap.ok)fail(snap.code);
+  const paths=handles.filter(h=>M._FPDFPageObj_GetType(h)!==1).map(h=>snapshotTinyUnderline(e,h));
+  const snap=snapshotTextObjects(e,handles.filter(h=>M._FPDFPageObj_GetType(h)===1));if(!snap.ok)fail(snap.code);
   const items=snap.items.map(it=>({top:it.bounds.t,bottom:it.bounds.b,order:it.index,it}));
   const grouped=groupLines(items);
   if(grouped.loose.length)fail('document_flow_loose_text_unsupported');
+  // Vertical clustering must not reorder mixed runs within a line merely
+  // because their glyph ascenders differ. Keep source paint/text order.
+  for(const line of grouped.lines)line.items.sort((a,b)=>a.order-b.order);
   // Cell-like gaps within one row are deliberately rejected; normal mixed
   // font runs touch or have a word-space sized gap.
   for(const line of grouped.lines){
     const row=[...line.items].sort((a,b)=>a.it.bounds.l-b.it.bounds.l);
-    for(let i=1;i<row.length;i++)if(row[i].it.bounds.l-row[i-1].it.bounds.r>2*Math.max(row[i].it.style.size,row[i-1].it.style.size))fail('document_flow_table_or_columns_unsupported');
+    const em=it=>it.style.size*Math.max(Math.hypot(it.style.matrix[0],it.style.matrix[1]),Math.hypot(it.style.matrix[2],it.style.matrix[3]));
+    for(let i=1;i<row.length;i++)if(row[i].it.bounds.l-row[i-1].it.bounds.r>2*Math.max(em(row[i].it),em(row[i-1].it)))fail('document_flow_table_or_columns_unsupported');
   }
-  return {pageIndex,handle:e.page,handles,items:snap.items,lines:grouped.lines.map(l=>({...l,origin,part:pageIndex})),band};
+  return {pageIndex,handle:e.page,handles,paths,items:snap.items,lines:grouped.lines.map(l=>({...l,origin,part:pageIndex})),band};
 }
 
-export async function compactDocumentFlow(engineFactory, sourceBytes, intermediatePdf, edits, preliminaryMap, maxNewPages=32, policy='strict') {
+export async function compactDocumentFlow(engineFactory, sourceBytes, intermediatePdf, edits, preliminaryMap, maxNewPages=32, policy='strict', annotationAdapter=null) {
   const starts=preliminaryMap.filter(m=>m.continuationPageIndices.length&&m.sourcePageIndex<preliminaryMap.length-1);
   if(!starts.length)return {pdf:intermediatePdf,sourcePageMap:preliminaryMap,flowGroups:[],addedPages:preliminaryMap.reduce((n,m)=>n+m.continuationPageIndices.length,0)};
   if(preliminaryMap.length>64)fail('document_flow_page_budget_exceeded');
+  if(annotationAdapter&&!['inspect','transport','validate'].every(k=>typeof annotationAdapter[k]==='function'))fail('document_flow_annotation_adapter_invalid');
+  const annotationModel=annotationAdapter?await annotationAdapter.inspect({sourceBytes,sourceSha256:createHash('sha256').update(sourceBytes).digest('hex')}):null;
+  if(annotationAdapter&&(!annotationModel||!Array.isArray(annotationModel.annotations)))fail('document_flow_annotation_inventory_mismatch');
   const src=await engineFactory(sourceBytes),e=await engineFactory(intermediatePdf);
   const M=e.M, held=new Set(), deleted=new Set(), groups=[], warnings=[], unowned=new Set();
+  for(const a of annotationModel?.annotations||[])if(a.preservedMissingDestination===true)warnings.push({code:'source_broken_link_preserved',severity:'warning',pageIndex:a.sourcePageIndex,annotationIndex:a.annotationIndex});
   // Pin intermediate pages so model/snapshot handles cannot be evicted.
   e.pinnedPages=new Set(Array.from({length:e.pageCount},(_,i)=>i));
   try {
-    const plans=[];
+    let plans=[];
     for(let start=0;start<preliminaryMap.length;start++){
       if(!preliminaryMap[start].continuationPageIndices.length||start===preliminaryMap.length-1)continue;
       const bands=[],parts=[],lines=[];let end=start,planned;
       try {
       for(;end<preliminaryMap.length;end++){
-        const band=deriveDocumentFlowBand(src,end,capturePageLayout);
+        const included=bands.map(b=>b.sourcePageIndex);
+        const targetBoundary=annotationModel?.annotations.some(a=>included.includes(a.sourcePageIndex)&&(a.internalDestinationSourcePageIndices||[a.destination?.targetSourcePageIndex].filter(Number.isInteger)).includes(end));
+        if(end>start&&targetBoundary){
+          if(bands.length<2)fail('document_flow_link_target_in_changed_body');
+          warnings.push({code:'document_flow_internal_target_boundary',severity:'info',pageIndex:start,boundarySourcePageIndex:end});
+          end--;break;
+        }
+        const band=deriveDocumentFlowBand(src,end,capturePageLayout,annotationModel);
         if(bands.length&&(Math.abs(band.width-bands[0].width)>.01||Math.abs(band.height-bands[0].height)>.01||Math.abs(band.x0-bands[0].x0)>2))fail('document_flow_incompatible_pages');
         bands.push(band);
         const map=preliminaryMap[end];
@@ -88,12 +107,35 @@ export async function compactDocumentFlow(engineFactory, sourceBytes, intermedia
       end=Math.min(end,preliminaryMap.length-1);
       // Clone preflight is part of eligibility, before any group mutates.
       for(const part of parts)if(!part.items.length)fail('document_flow_empty_body_unsupported');
-      plans.push({start,end,bands,parts,lines,pages:planned});start=end;
+      const plan={start,end,bands,parts,lines,pages:planned};
+      plan.linkMoves=deriveNativeLinkMoves(src,bands,plannedLinkGlyphs(plan),edits,annotationModel,expectedPageText);
+      const stagedGlyphs=parts.flatMap(part=>part.lines.flatMap(line=>line.items.flatMap(({it})=>it.chars.filter(c=>c.u>32).map(c=>({u:c.u,outputPageIndex:part.pageIndex,box:{l:c.l,r:c.r,b:c.b,t:c.t}})))));
+      const stagedMoves=deriveNativeLinkMoves(src,bands,stagedGlyphs,edits,annotationModel,expectedPageText);
+      plan.underlines=matchStagedUnderlines(bands,parts,stagedMoves);
+      plans.push(plan);start=end;
       } catch(error) {
         if(policy!=='compatible-groups')throw error;
         warnings.push({code:'document_flow_barrier_not_compacted',severity:'warning',pageIndex:start,reason:error?.code||'document_flow_failed'});
       }
     }
+    const allSourcePages=plans.flatMap(p=>p.bands.map(b=>b.sourcePageIndex));
+    plans=plans.filter(p=>{
+      const own=p.bands.map(b=>b.sourcePageIndex);
+      const unresolved=annotationModel?.annotations.some(a=>a.destinationUnresolved===true&&a.preservedMissingDestination!==true);
+      const actionOwnershipUnsupported=annotationModel?.actionOwnershipUnsupported===true;
+      const blocked=annotationModel?.annotations.some(a=>{
+        const targets=a.internalDestinationSourcePageIndices||[a.destination?.targetSourcePageIndex].filter(Number.isInteger);
+        return targets.some(i=>own.includes(i))||own.includes(a.sourcePageIndex)&&targets.some(i=>allSourcePages.includes(i));
+      });
+      const reason=actionOwnershipUnsupported?'document_flow_link_action_ownership_unsupported':unresolved?'document_flow_link_unresolved_target':'document_flow_link_target_in_changed_body';
+      if(unresolved||actionOwnershipUnsupported){
+        if(policy!=='compatible-groups')fail(reason);
+        warnings.push({code:'document_flow_barrier_not_compacted',severity:'warning',pageIndex:p.start,reason});return false;
+      }
+      if(!blocked)return true;
+      if(policy!=='compatible-groups')fail(reason);
+      warnings.push({code:'document_flow_barrier_not_compacted',severity:'warning',pageIndex:p.start,reason});return false;
+    });
     if(!plans.length)return {pdf:intermediatePdf,sourcePageMap:preliminaryMap,flowGroups:[],addedPages:preliminaryMap.reduce((n,m)=>n+m.continuationPageIndices.length,0),warnings};
     // Snapshot original destination edges while every original object lives.
     for(const p of plans){
@@ -107,6 +149,12 @@ export async function compactDocumentFlow(engineFactory, sourceBytes, intermedia
         const h=cloneTextObject(e,it);if(!h)fail('document_flow_clone_failed');
         unowned.add(h);M._FPDFPageObj_Transform(h,1,0,0,1,0,dy);return {h,it,dy,origin:p.lines[index].origin};
       })));
+      p.pathClones=p.pages.map(()=>[]);
+      for(const {source}of p.underlines){
+        const move=p.linkMoves.find(m=>m.sourcePageIndex===source.sourcePageIndex&&m.annotationIndex===source.annotationIndex);
+        if(!move)fail('document_flow_underline_link_move_missing');
+        const h=cloneUnderline(e,source,move.dx,move.dy);unowned.add(h);p.pathClones[move.outputPageIndex].push({h,source,move});
+      }
     }
     for(const p of plans){
       for(const part of p.parts)for(const h of part.handles){if(!M._FPDFPage_RemoveObject(part.handle,h))fail('document_flow_remove_failed');unowned.add(h);}
@@ -127,9 +175,11 @@ export async function compactDocumentFlow(engineFactory, sourceBytes, intermedia
         // Body block follows top edges, precedes bottom edges in list order.
         let at=remain.findIndex(h=>{const b=e.objectBounds(h);return b&&b.y+b.h/2<d.band.floor;});
         if(at<0)at=remain.length;
-        for(const c of p.clones[k]){if(!M._FPDFPage_InsertObjectAtIndex(d.handle,c.h,at++))fail('document_flow_insert_failed');unowned.delete(c.h);}
+        const ordered=[...p.pathClones[k].filter(c=>c.source.paint==='before'),...p.clones[k],...p.pathClones[k].filter(c=>c.source.paint==='after')];
+        for(const c of ordered){if(!M._FPDFPage_InsertObjectAtIndex(d.handle,c.h,at++))fail('document_flow_insert_failed');unowned.delete(c.h);}
         if(!M._FPDFPage_GenerateContent(d.handle))fail('document_flow_generate_failed');
         for(const c of p.clones[k])if(!verifyTextObject(e,d.handle,c.it,c.h,c.dy))fail('document_flow_clone_mismatch');
+        for(const c of p.pathClones[k])if(!underlineEqual(snapshotTinyUnderline(e,c.h),c.source,c.move.dx,c.move.dy))fail('document_flow_underline_clone_mismatch');
       }
       for(const part of p.parts){
         if(preliminaryMap.some(m=>m.continuationPageIndices.includes(part.pageIndex)))deleted.add(part.pageIndex);
@@ -157,15 +207,21 @@ export async function compactDocumentFlow(engineFactory, sourceBytes, intermedia
       }
       out+=1+n;
     }
+    const annotationMoves=[];
     for(const p of plans){
       const indices=[...p.bands.map(b=>map[b.sourcePageIndex].outputPageIndex),...map[p.end].continuationPageIndices];
+      annotationMoves.push(...p.linkMoves.map(move=>({...move,outputPageIndex:indices[move.outputPageIndex]})));
       const contentMap=p.bands.map(b=>({sourcePageIndex:b.sourcePageIndex,outputPageIndices:indices.filter((_,i)=>p.clones[i].some(c=>c.origin===b.sourcePageIndex))}));
       for(const c of contentMap)map[c.sourcePageIndex].contentOutputPageIndices=[...c.outputPageIndices];
       groups.push({version:1,sourcePages:p.bands.map(({sourcePageIndex,bodyTop,flowTop,floor,x0,x1})=>({sourcePageIndex,bodyTop,flowTop,floor,x0,x1})),outputPages:indices.map((outputPageIndex,i)=>({outputPageIndex,...Object.fromEntries(['bodyTop','flowTop','floor'].map(k=>[k,p.pages[i][k]])),x0:Math.min(...p.bands.map(b=>b.x0)),x1:Math.max(...p.bands.map(b=>b.x1)),lineCount:p.pages[i].lines.length})),contentMap});
     }
     e.pageCount=M._FPDF_GetPageCount(e.doc);
-    const pdf=new Uint8Array(e.save());if(!pdf.length)fail('document_flow_save_failed');
-    return {pdf,sourcePageMap:map,flowGroups:groups,addedPages:e.pageCount-map.length,warnings};
+    let pdf=new Uint8Array(e.save());if(!pdf.length)fail('document_flow_save_failed');
+    if(annotationAdapter&&annotationModel.annotations.length){
+      const transported=await annotationAdapter.transport({model:annotationModel,sourceBytes,outputBytes:pdf,sourcePageMap:map,moves:annotationMoves,reflowedSourcePages:plans.flatMap(p=>p.bands.map(b=>b.sourcePageIndex))});
+      pdf=new Uint8Array(transported?.pdf??transported);if(!pdf.length)fail('document_flow_annotation_transport_failed');
+    }
+    return {pdf,sourcePageMap:map,flowGroups:groups,annotationMoves,addedPages:e.pageCount-map.length,warnings};
   } finally {
     for(const h of unowned)try{M._FPDFPageObj_Destroy(h);}catch{}
     const cached=new Set(e._pageCache?.values()||[]);if(e.page)cached.add(e.page);

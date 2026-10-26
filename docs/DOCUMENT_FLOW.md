@@ -20,8 +20,9 @@ be reclaimed later does not bypass that initial resource bound.
 
 At most 64 original source pages, 5,000 objects and 100,000 extracted characters
 per participating page, 10,000 lines per group, full-body single-column text chains, matching
-page sizes and column left edges, unrotated/uncropped geometry, top-level
-unshared text, and no annotations. Each source page's own running headers,
+page sizes and column left edges, unrotated/uncropped geometry and top-level
+unshared text. Annotations are barriers unless a trusted raw dictionary adapter
+is injected as described below. Each source page's own running headers,
 footers and page numbers stay fixed. Only new terminal pages receive the last
 source page's declared continuation edge style and suffixed page numbers.
 The first implementation uses full-body groups: `flowTop === bodyTop`. It does
@@ -33,8 +34,8 @@ widely separated text cells in a row, forms, Type3 text, unsupported glyphs,
 blank/ambiguous body pages, clip paths, transparency, non-horizontal matrices,
 invisible/clipping text modes, and non-BMP source characters are refused.
 These conservative checks can refuse legitimate layouts. They do not provide
-general table/figure semantics. Short inline underline paths supported by the
-older continuation mover also remain barriers to document compaction.
+general table/figure semantics. Tiny straight inline paths have the narrow
+source Link ownership contract described below; arbitrary paths remain barriers.
 
 Original line shapes and spacing within each intermediate page part are kept.
 A physical page boundary is replaced by a measured line pitch, not a large
@@ -123,3 +124,78 @@ and use content mappings for preview navigation. Dropping the group metadata
 does not grant a pass: changed formerly unedited destination pages then fail
 the existing per-page checks. Hash/revision guards and immutable source draft
 bindings remain necessary.
+
+## Optional trusted Link dictionary adapter
+
+`options.annotationAdapter` is a code-level dependency with asynchronous
+`inspect`, `transport` and `validate` methods. It is never accepted from request
+JSON or a transported report. The app implementation uses its already pinned
+MuPDF raw object API. `inspect({sourceBytes,sourceSha256})` binds a private model
+to immutable source bytes and exposes numeric annotation descriptors. Raw URI,
+action, named destination and dictionary values remain private to the adapter.
+Native source checks independently compare descriptor page/index/subtype/rect
+against the PDFium source inventory before allowing annotations in a group.
+
+The engine associates original Link rectangles with every intersecting source
+glyph, including partially intersecting edge glyphs. It maps original character
+indices through the exact selected Before/After spans, including the existing
+source-proven discretionary-hyphen handling. It never searches for a repeated
+link label to guess its identity. An edited linked label, overlapping ownership,
+new ambiguous output ownership, multiple output pages, line splitting, or a
+change in relative glyph geometry is an explicit barrier. A supported unchanged
+span must have one rigid translation on one output page. Fixed edge links stay
+on their own original pages.
+
+After native body reconstruction, `transport` moves the original existing Link
+PDF dictionary between output `/Annots` arrays, updating only translated Rect,
+QuadPoints and owning page P. It preserves unknown dictionary members, complete
+nested actions and strings; no URI is opened and no action is executed. Saved
+QA re-inspects immutable source bytes, rederives moves from actual saved glyphs,
+then invokes adapter validation of all original annotation dictionary semantics,
+geometry and ownership. `pagination.annotationMoves` contains only numeric
+diagnostics and is never authority for this saved check.
+
+Resolved local targets must stay outside changed flow pages, including targets
+of annotations owned by other pages and nested actions. When the next proposed
+source page is a target of the included prefix, the planner stops before that
+page and may use terminal tail pages. The minimum two-original-page chain still
+applies. Backlinks into the initial changed body are barriers: arbitrary FitH/XYZ
+scroll positions are not guessed to be glyph anchors. Unknown actions, action
+ownership roots, tagged/shared annotations and unresolved target semantics stay
+unsupported. One explicit inherited-source exception is a named destination
+whose exact name and complete catalog absence are proven by the trusted adapter
+both before and after output. It remains broken, receives
+`source_broken_link_preserved`, and no target is invented.
+
+Tiny straight citation underlines may be reconstructed only when one immutable
+source Link rectangle uniquely owns their endpoints and associated glyphs, their
+width is at most two effective source ems, and all supported segments, matrix,
+draw mode, RGBA fill/stroke, stroke width, cap/join and paint relation are known.
+Curves, tables/rules, wide or unowned paths, dash, marks, transparency and actual
+clipping paths are barriers. A source path must match exactly one staged path
+by its complete shape/style either at its original source location or at its
+independently proven staged glyph translation; proximity is not identity. The
+final fresh path uses the same final translation as its link glyphs. Clone and
+reopened saved checks reject missing, duplicate, moved or recolored paths.
+The reopened check also enumerates the actual saved page's object order and
+compares each path with the exact source-owned label glyph objects selected
+by its translated immutable source rectangle. Its original all-before or
+all-after relation must hold for every owning glyph object; unrelated text
+elsewhere on the page does not determine that relation. Reordering an
+otherwise identical stroked path across its label is a failed saved check.
+Native color readback does not establish original ICC/stream byte identity;
+independent render review remains required. Existing staging pagination can
+still reject a decoration before this post-edit phase.
+
+Validation on the real cold-shower eight-edit case remains deliberately
+distinct from synthetic success: 15 source pages produce 18 output pages,
+eight edits and the saved self-check pass, but no document-flow group compacts.
+The fixed table on page 6 remains a barrier. Bibliography backlinks on source
+page 14 target moving body pages 10/11, so exact target protection retains that
+staged group. This feature does not claim natural-flow completion for that paper.
+
+The actual adapter integration tests run with
+`FALSIFY_ANNOTATION_ADAPTER_ROOT` pointing to the app worktree containing its
+`app/src/document-flow-annotations.mjs` and pinned MuPDF vendor. Without this
+explicit dependency, standalone tests skip only the app-adapter integration
+cases and continue to enforce the annotation barrier.

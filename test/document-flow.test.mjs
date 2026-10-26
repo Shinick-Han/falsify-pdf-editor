@@ -3,7 +3,11 @@ import { test } from 'node:test';
 import { loadRuntime } from '../src/runtime.mjs';
 import { editPdf } from '../src/editor.mjs';
 import { planDocumentLines } from '../src/document-flow.mjs';
-import { inspectSavedPdf } from '../src/quality.mjs';
+import { inspectSavedPdf, capturePageLayout, expectedPageText } from '../src/quality.mjs';
+import { deriveDocumentFlowBand } from '../src/document-flow-band.mjs';
+import { deriveNativeLinkMoves, readLinkPageCharacters } from '../src/document-flow-links.mjs';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 export function flowFixture({pages=3,foreign=false,mixed=true,denseAll=false,table=false,singleStream=false}={}) {
  const objects=['<< /Type /Catalog /Pages 2 0 R >>',''];
@@ -166,4 +170,165 @@ test('immutable source bands reject output-only, source-only and jointly forged 
  const forged=structuredClone(flowGroups);forged[0].sourcePages[1].sourcePageIndex=2;
  const membership=await inspectSavedPdf(runtime.engineFactory,sourceBytes,output,edits,{sourcePageMap,flowGroups:forged});
  assert.equal(membership.ok,false);assert.ok(membership.failures.some(f=>f.code==='document_flow_map_invalid'));
+});
+
+test('native link association uses partial intersections and stable source ranges across earlier edits',real,async()=>{
+ const source=await runtime.engineFactory(flowFixture());
+ try {
+  const bands=[0,1].map(i=>deriveDocumentFlowBand(source,i,capturePageLayout));
+  const body=band=>readLinkPageCharacters(source,band.sourcePageIndex).filter(c=>c.u>32&&c.box&&(c.box.b+c.box.t)/2>=band.floor-.5&&(c.box.b+c.box.t)/2<=band.bodyTop+.5);
+  const pages=bands.map(body),raw=pages[1].map(c=>String.fromCharCode(c.u)).join(''),at=raw.indexOf('Another');
+  const label=pages[1].slice(at,at+7),rect=[label[0].box.l+.1,Math.min(...label.map(c=>c.box.b)),label.at(-1).box.r-.1,Math.max(...label.map(c=>c.box.t))];
+  assert.ok(label[0].box.l<rect[0]&&label.at(-1).box.r>rect[2]);
+  const model={annotations:[{sourcePageIndex:1,annotationIndex:0,rect,kind:'link',eligible:true,destination:{type:'uri'},internalDestinationSourcePageIndices:[]}]};
+  const target=pages.flatMap((cs,page)=>cs.map(c=>({...c,outputPageIndex:page?2:0,box:{l:c.box.l+3,r:c.box.r+3,b:c.box.b-28,t:c.box.t-28}})));
+  let moves=deriveNativeLinkMoves(source,bands,target,[],model,expectedPageText);
+  assert.equal(moves.length,1);assert.equal(moves[0].outputPageIndex,2);assert.ok(Math.abs(moves[0].dx-3)<.001&&Math.abs(moves[0].dy+28)<.001);
+  // A preceding selected Before->After changes character counts, but never
+  // rebinds the later identical label by a text search.
+  const needle='Sourcepage0begins',replacement='Seed';
+  const prefix=needle.length;
+  const edited=[...[...replacement].map(ch=>({...target[0],u:ch.charCodeAt(0)})),...target.slice(prefix)];
+  moves=deriveNativeLinkMoves(source,bands,edited,[{id:'earlier',pageIndex:0,before:'Source page 0 begins',after:replacement}],model,expectedPageText);
+  assert.equal(moves.length,1);assert.equal(moves[0].outputPageIndex,2);
+  const repeatedAt=pages[0].map(c=>String.fromCharCode(c.u)).join('').indexOf('Another'),repeated=pages[0].slice(repeatedAt,repeatedAt+7);
+  const repeatedDescriptor={...model.annotations[0],sourcePageIndex:0,rect:[repeated[0].box.l,Math.min(...repeated.map(c=>c.box.b)),repeated.at(-1).box.r,Math.max(...repeated.map(c=>c.box.t))]};
+  const repeatedMoves=deriveNativeLinkMoves(source,bands,target,[],{annotations:[repeatedDescriptor,...model.annotations]},expectedPageText);
+  assert.deepEqual(repeatedMoves.map(m=>[m.sourcePageIndex,m.outputPageIndex]),[[0,0],[1,2]]);
+  const edgeChars=readLinkPageCharacters(source,1).filter(c=>c.box&&c.box.b>740).slice(0,5);
+  const edge={...model.annotations[0],annotationIndex:1,rect:[edgeChars[0].box.l,Math.min(...edgeChars.map(c=>c.box.b)),edgeChars.at(-1).box.r,Math.max(...edgeChars.map(c=>c.box.t))]};
+  const withFixedEdge=deriveNativeLinkMoves(source,bands,target,[],{annotations:[...model.annotations,edge]},expectedPageText);
+  assert.equal(withFixedEdge.length,1);assert.equal(withFixedEdge[0].annotationIndex,0);
+  const duplicated={annotations:[...model.annotations,{...model.annotations[0],annotationIndex:1}]};
+  assert.throws(()=>deriveNativeLinkMoves(source,bands,target,[],duplicated,expectedPageText),e=>e.code==='document_flow_link_overlapping_ownership');
+  const internal={annotations:[{...model.annotations[0],destination:{type:'internal',targetSourcePageIndex:0},internalDestinationSourcePageIndices:[0]}]};
+  assert.throws(()=>deriveNativeLinkMoves(source,bands,target,[],internal,expectedPageText),e=>e.code==='document_flow_link_target_in_changed_body');
+  const split=structuredClone(target);split[pages[0].length+at+1].outputPageIndex=3;
+  assert.throws(()=>deriveNativeLinkMoves(source,bands,split,[],model,expectedPageText),e=>e.code==='document_flow_link_split_page');
+  const nonRigid=structuredClone(target);nonRigid[pages[0].length+at+1].box.l+=1;
+  assert.throws(()=>deriveNativeLinkMoves(source,bands,nonRigid,[],model,expectedPageText),e=>e.code==='document_flow_link_not_rigid_translation');
+  const editedLabel=[...target.slice(0,pages[0].length+at),...target.slice(pages[0].length+at+7)];
+  assert.throws(()=>deriveNativeLinkMoves(source,bands,editedLabel,[{id:'label',pageIndex:1,before:'Another',after:''}],model,expectedPageText),e=>e.code==='document_flow_link_edited_label');
+ } finally {source.close();}
+});
+
+// Optional app-owned raw dictionary adapter; explicit path injects the
+// already-vendored runtime without adding a second engine dependency here.
+let annotationRuntime;
+if(process.env.FALSIFY_ANNOTATION_ADAPTER_ROOT){
+ const root=process.env.FALSIFY_ANNOTATION_ADAPTER_ROOT;
+ const mupdf=await import(pathToFileURL(resolve(root,'app/dist/browser-pdf-vendor/mupdf.js')).href);
+ const {createAnnotationTransport}=await import(pathToFileURL(resolve(root,'app/src/document-flow-annotations.mjs')).href);
+ annotationRuntime={mupdf,adapter:createAnnotationTransport({mupdf})};
+}
+const annotationsReal={skip:(!runtime||!annotationRuntime)&&'native runtime and explicit raw annotation adapter required'};
+async function annotatedFixture({underlines=false,variant='normal',denseAll=false,targetPage=3}={}){
+ const bytes=flowFixture({pages:4,denseAll}),e=await runtime.engineFactory(bytes),descriptors=[];
+ try{
+  for(const [pageIndex,needle,last,edge]of [[0,'Theunchangedline17',true,false],[1,'Another',false,false],[1,'Synthetic',false,true]]){
+   const chars=readLinkPageCharacters(e,pageIndex).filter(c=>c.box&&(edge?c.box.b>740:c.box.b>80&&c.box.t<720)),raw=chars.map(c=>String.fromCharCode(c.u)).join(''),at=last?raw.lastIndexOf(needle):raw.indexOf(needle),label=chars.slice(at,at+(edge?9:3));
+   assert.ok(at>=0);descriptors.push({pageIndex,rect:[label[0].box.l+.1,Math.min(...label.map(c=>c.box.b)),label.at(-1).box.r-.1,Math.max(...label.map(c=>c.box.t))],edge});
+  }
+ }finally{e.close();}
+ const {mupdf}=annotationRuntime,d=new mupdf.PDFDocument(bytes);
+ try{
+  const pages=Array.from({length:4},(_,i)=>d.findPage(i));
+  if(underlines){
+   // Match a normal citation's independently painted label object, as on
+   // real papers, so the existing staging pagination can bind its underline.
+   const contents=pages[0].get('Contents'),old=contents.get(1),buffer=old.readStream();let text;
+   try{text=new TextDecoder().decode(buffer.asUint8Array());}finally{buffer.destroy();}
+   text=text.replace('(The unchanged line 17','(The) Tj ( unchanged line 17');
+   contents.put(1,d.addStream(new TextEncoder().encode(text),{}));
+  }
+  d.getTrailer().get('Root').put('Dests',{outsideTarget:[pages[targetPage],'XYZ',50,700,null]});
+  for(const [i,{pageIndex,rect,edge}]of descriptors.entries()){
+   const [l,b,r,t]=rect,action={S:'URI',URI:d.newString(`https://example.invalid/never-open-${i}`),PrivateUnknown:{Keep:true,Value:d.newString('preserved-private-value')},Next:{S:'URI',URI:d.newString('https://other.invalid/never-open')}};
+   const object={Type:'Annot',Subtype:'Link',Rect:rect,QuadPoints:[l,t,r,t,l,b,r,b],Border:[0,0,0],F:4,P:pages[pageIndex],PrivateUnknown:{Keep:true}};
+   if(i===1)object.Dest=d.newString('outsideTarget');else object.A=action;
+   const old=pages[pageIndex].get('Annots'),array=old.isArray()?old:d.newArray();array.push(d.addObject(object));pages[pageIndex].put('Annots',array);
+   if(underlines&&!edge&&!(variant==='stroke'&&i===0)){
+    const clip=variant==='clip'?`${l} ${b} ${(r-l)/2} 1 re W n `:'';
+    const shape=variant==='curve'?`${l} ${b+.25} m ${l} ${b} ${r} ${b} ${r} ${b+.25} c`:variant==='grid'?`${l} ${b} 20 20 re`:variant==='stroke'?`${l} ${b+.25} m ${r} ${b+.25} l`:`${l} ${b+.25} m ${variant==='long'?r+200:r} ${b+.25} l ${l} ${b+.25} l h`;
+    const path=`q ${clip}0 0 1 rg 0 0 1 RG 0.4 w ${variant==='dash'?'[1 1] 0 d ':''}${shape} ${variant==='stroke'?'S':'f'} Q\n`;
+    const stream=d.addStream(new TextEncoder().encode(path),{}),content=pages[pageIndex].get('Contents');
+    const contents=content.isArray()?content:d.newArray();if(!content.isArray())contents.push(content);
+    contents.push(stream);if(variant==='duplicate')contents.push(stream);pages[pageIndex].put('Contents',contents);
+   }
+  }
+  const out=d.saveToBuffer('garbage=0,compress=false');try{return out.asUint8Array().slice();}finally{out.destroy();}
+ }finally{d.destroy();}
+}
+test('real raw link dictionaries move with source glyph spans while fixed edge and outside named target stay intact',annotationsReal,async()=>{
+ const sourceBytes=await annotatedFixture(),edits=[{id:'grow',pageIndex:0,before,after},{id:'second',pageIndex:1,before:'Source page 1 begins',after:'Source page 1 starts with an independently edited phrase'}];
+ const result=await editPdf({sourceBytes,edits,reflow:true},{documentFlow:true,engineFactory:runtime.engineFactory,annotationAdapter:annotationRuntime.adapter});
+ assert.equal(result.report.ok,true);assert.equal(result.report.selfCheck.annotationCheck.ok,true);
+ const moves=result.report.pagination.annotationMoves;
+ assert.equal(moves.length,2);assert.equal(moves.find(m=>m.sourcePageIndex===0).outputPageIndex,1);
+ assert.ok(!moves.some(m=>m.sourcePageIndex===1&&m.annotationIndex===1));
+ const map=result.report.pagination.sourcePageMap,groups=result.report.pagination.flowGroups;
+ const mutate=callback=>{const doc=new annotationRuntime.mupdf.PDFDocument(result.pdf);try{callback(doc);const b=doc.saveToBuffer('garbage=0,compress=false');try{return b.asUint8Array().slice();}finally{b.destroy();}}finally{doc.destroy();}};
+ const moved=moves.find(m=>m.sourcePageIndex===0);
+ // The named destination annotation remains first on p1; the moved p0 URI
+ // annotation is located by its private URI only within this test fixture.
+ const findUri=d=>{const arr=d.findPage(moved.outputPageIndex).get('Annots');for(let i=0;i<arr.length;i++){const a=arr.get(i);if(a.get('A','URI').asString()==='https://example.invalid/never-open-0')return a;}throw Error('missing test URI');};
+ for(const corrupt of [
+  d=>findUri(d).get('A').put('URI',d.newString('https://changed.invalid/never-open')),
+  d=>{const a=findUri(d),q=a.get('QuadPoints');q.put(0,q.get(0).asNumber()+1);},
+  d=>{const page=d.findPage(moved.outputPageIndex),arr=page.get('Annots'),keep=d.newArray(),chosen=findUri(d);for(let i=0;i<arr.length;i++)if(arr.get(i).asIndirect()!==chosen.asIndirect())keep.push(arr.get(i));page.put('Annots',keep);},
+ ]){
+  const check=await inspectSavedPdf(runtime.engineFactory,sourceBytes,mutate(corrupt),edits,{sourcePageMap:map,flowGroups:groups,annotationAdapter:annotationRuntime.adapter});
+  assert.equal(check.ok,false);assert.equal(check.annotationCheck.ok,false);
+ }
+});
+test('tiny supported link underlines clone with the exact glyph/link translation and saved path corruption fails',annotationsReal,async()=>{
+ const sourceBytes=await annotatedFixture({underlines:true}),edits=[{id:'grow',pageIndex:0,before,after}];
+ const result=await editPdf({sourceBytes,edits,reflow:true},{documentFlow:true,engineFactory:runtime.engineFactory,annotationAdapter:annotationRuntime.adapter});
+ assert.equal(result.report.ok,true);assert.equal(result.report.pagination.annotationMoves.length,2);
+ const visibleSource=await annotatedFixture({underlines:true,variant:'stroke'});
+ const visible=await editPdf({sourceBytes:visibleSource,edits,reflow:true},{documentFlow:true,engineFactory:runtime.engineFactory,annotationAdapter:annotationRuntime.adapter});
+ assert.equal(visible.report.ok,true);
+ // Exact independent-review regression: all geometry/colors remain equal,
+ // but moving the saved stroked path before its source-owned label changes
+ // rendered pixels. Its relation to unrelated page text is not the rule.
+ const reordered=await runtime.engineFactory(visible.pdf);let changedPaint;
+ try{
+  reordered.loadPage(1);const M=reordered.M,objects=Array.from({length:M._FPDFPage_CountObjects(reordered.page)},(_,i)=>M._FPDFPage_GetObject(reordered.page,i)),h=objects.find(h=>M._FPDFPageObj_GetType(h)===2);
+  assert.ok(objects.indexOf(h)>0);assert.ok(M._FPDFPage_RemoveObject(reordered.page,h));assert.ok(M._FPDFPage_InsertObjectAtIndex(reordered.page,h,0));
+  reordered._pageDirty=true;changedPaint=reordered.save();
+ }finally{reordered.close();}
+ const paintCheck=await inspectSavedPdf(runtime.engineFactory,visibleSource,changedPaint,edits,{sourcePageMap:visible.report.pagination.sourcePageMap,flowGroups:visible.report.pagination.flowGroups,annotationAdapter:annotationRuntime.adapter});
+ assert.equal(paintCheck.ok,false);assert.ok(paintCheck.failures.some(f=>f.code==='document_flow_underline_paint_order_mismatch'));
+ const {sourcePageMap,flowGroups}=result.report.pagination;
+ for(const mutation of ['shift','color','remove']){
+  const e=await runtime.engineFactory(result.pdf);let changed;
+  try{
+   e.loadPage(1);const M=e.M,h=Array.from({length:M._FPDFPage_CountObjects(e.page)},(_,i)=>M._FPDFPage_GetObject(e.page,i)).find(h=>M._FPDFPageObj_GetType(h)===2);
+   assert.ok(h);
+   if(mutation==='shift')e.translateObject(h,0,1);
+   else if(mutation==='color')assert.ok(M._FPDFPageObj_SetFillColor(h,255,0,0,255));
+   else{assert.ok(M._FPDFPage_RemoveObject(e.page,h));M._FPDFPageObj_Destroy(h);}
+   e._pageDirty=true;changed=e.save();
+  }finally{e.close();}
+  const check=await inspectSavedPdf(runtime.engineFactory,sourceBytes,changed,edits,{sourcePageMap,flowGroups,annotationAdapter:annotationRuntime.adapter});
+  assert.equal(check.ok,false,mutation);assert.ok(check.failures.some(f=>f.code==='document_flow_underline_saved_mismatch'),mutation);
+ }
+ for(const variant of ['long','dash','duplicate','curve','clip','grid']){
+  await assert.rejects(editPdf({sourceBytes:await annotatedFixture({underlines:true,variant}),edits,reflow:true},{documentFlow:true,engineFactory:runtime.engineFactory,annotationAdapter:annotationRuntime.adapter}),e=>e.code==='LAYOUT_UNSUPPORTED');
+ }
+});
+test('internal target page stops an eligible text prefix and terminal tail preserves target identity and coordinates',annotationsReal,async()=>{
+ const sourceBytes=await annotatedFixture({denseAll:true,targetPage:2}),edits=[{id:'grow',pageIndex:0,before,after}];
+ const result=await editPdf({sourceBytes,edits,reflow:true},{documentFlow:true,engineFactory:runtime.engineFactory,annotationAdapter:annotationRuntime.adapter});
+ assert.equal(result.report.ok,true);const p=result.report.pagination;
+ assert.deepEqual(p.flowGroups[0].sourcePages.map(b=>b.sourcePageIndex),[0,1]);
+ assert.ok(p.sourcePageMap[1].continuationPageIndices.length>0);assert.equal(p.sourcePageMap[2].outputPageIndex,2+p.addedPages);
+ assert.ok(result.report.warnings.some(w=>w.code==='document_flow_internal_target_boundary'&&w.boundarySourcePageIndex===2));
+ assert.equal(result.report.selfCheck.pages.find(p=>p.pageIndex===2).text_equal,true);
+ const {mupdf}=annotationRuntime,old=new mupdf.PDFDocument(sourceBytes),out=new mupdf.PDFDocument(result.pdf);
+ try{
+  const a=old.getTrailer().get('Root','Dests','outsideTarget'),b=out.getTrailer().get('Root','Dests','outsideTarget');
+  assert.equal(b.get(0).asIndirect(),out.findPage(p.sourcePageMap[2].outputPageIndex).asIndirect());
+  for(let i=1;i<a.length;i++)assert.equal(b.get(i).toString(),a.get(i).toString());
+ }finally{old.destroy();out.destroy();}
 });

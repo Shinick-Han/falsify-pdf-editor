@@ -2,6 +2,8 @@
 // checker call this against immutable source bytes. captureLayout is injected
 // to keep this module independent of the quality/compaction module graph.
 import { unsupportedPage } from './pagination.mjs';
+import { validateNativeLinkInventory } from './document-flow-links.mjs';
+import { sourceUnderline } from './document-flow-underlines.mjs';
 
 const fail = code => { throw Object.assign(new Error(code), {code}); };
 export function checkDocumentFlowPageBudget(e) {
@@ -12,12 +14,12 @@ export function checkDocumentFlowPageBudget(e) {
   finally {if(text)M._FPDFText_ClosePage(text);}
 }
 
-export function deriveDocumentFlowBand(engine, sourcePageIndex, captureLayout) {
+export function deriveDocumentFlowBand(engine, sourcePageIndex, captureLayout, annotationModel = null) {
   engine.loadPage(sourcePageIndex);
   checkDocumentFlowPageBudget(engine);
   if (unsupportedPage(engine)) fail('document_flow_geometry_unsupported');
   const M=engine.M;
-  if(typeof M._FPDFPage_GetAnnotCount!=='function'||M._FPDFPage_GetAnnotCount(engine.page)!==0)fail('document_flow_annotations_unsupported');
+  validateNativeLinkInventory(engine,sourcePageIndex,annotationModel);
   const ctx=captureLayout(engine,sourcePageIndex,engine.buildModel());
   const body=ctx.paras.filter(q=>q.role==='body'&&q.box);
   if(!body.length||body.some(q=>!q.editable||q.sharesObjects||!q.topLevel))fail('document_flow_body_unsupported');
@@ -33,12 +35,17 @@ export function deriveDocumentFlowBand(engine, sourcePageIndex, captureLayout) {
   const floor=Math.max(0,...edgeTop,Math.min(ctx.pageH*.1,...bounds.map(b=>b.y)));
   if(!(bodyTop>floor))fail('document_flow_band_invalid');
   const owned=new Set(ctx.paras.flatMap(q=>q.handles));
+  const underlines=[];
   const n=M._FPDFPage_CountObjects(engine.page);
   for(let i=0;i<n;i++){
     const h=M._FPDFPage_GetObject(engine.page,i)>>>0;
     if(owned.has(h))continue;
     const b=engine.objectBounds(h);
-    if(!b||b.y+b.h>=floor&&b.y<=bodyTop)fail('document_flow_foreign_object_unsupported');
+    if(!b)fail('document_flow_foreign_object_unsupported');
+    if(b.y+b.h>=floor&&b.y<=bodyTop){
+      if(!annotationModel||M._FPDFPageObj_GetType(h)!==2)fail('document_flow_foreign_object_unsupported');
+      underlines.push(sourceUnderline(engine,h,sourcePageIndex,annotationModel));
+    }
   }
-  return {sourcePageIndex,bodyTop,flowTop:bodyTop,floor,x0,x1,width:ctx.pageW,height:ctx.pageH};
+  return {sourcePageIndex,bodyTop,flowTop:bodyTop,floor,x0,x1,width:ctx.pageW,height:ctx.pageH,underlines};
 }

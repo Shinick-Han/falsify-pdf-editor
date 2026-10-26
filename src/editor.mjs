@@ -34,7 +34,8 @@ export const EDITOR_CAPABILITIES = Object.freeze({
   documentFlow: Object.freeze({
     supported: true, version: 1, optIn: true,
     policies: Object.freeze(["strict", "compatible-groups"]),
-    scope: "bounded whole-body single-column text chains; original next pages first; tables, figures, annotations and ambiguous styles are barriers",
+    scope: "bounded whole-body single-column text chains; original next pages first; tables, figures and ambiguous styles are barriers; Link annotations require a trusted raw dictionary adapter",
+    annotations: "optional trusted annotationAdapter; exact unchanged glyph ranges with one rigid translation and preserved raw Link dictionaries; tiny uniquely owned straight citation paths only",
     maxSourcePages: 64,
   }),
   continuationStyle: Object.freeze({
@@ -573,13 +574,14 @@ export async function editPdf(request, options = {}) {
     sourcePageMap.push(entry);
     out += 1 + n;
   }
-  let flowGroups = [];
+  let flowGroups = [], annotationMoves = [];
   const documentFlowEnabled = options.documentFlow === true || options.documentFlow === 'compatible-groups';
   if (documentFlowEnabled && added > 0) {
     try {
-      const compacted = await compactDocumentFlow(engineFactory, sourceBytes, pdf, edits, sourcePageMap, pg.max, options.documentFlow === 'compatible-groups' ? 'compatible-groups' : 'strict');
+      const compacted = await compactDocumentFlow(engineFactory, sourceBytes, pdf, edits, sourcePageMap, pg.max, options.documentFlow === 'compatible-groups' ? 'compatible-groups' : 'strict', options.annotationAdapter ?? null);
       pdf = compacted.pdf; sourcePageMap = compacted.sourcePageMap;
       added = compacted.addedPages; flowGroups = compacted.flowGroups;
+      annotationMoves = compacted.annotationMoves ?? [];
       report.warnings.push(...(compacted.warnings ?? []));
     } catch (err) {
       throw fail("LAYOUT_UNSUPPORTED", "Document flow could not preserve the compatible text chain", {cause: err?.code ?? "document_flow_failed"});
@@ -592,6 +594,7 @@ export async function editPdf(request, options = {}) {
     addedPages: added,
     sourcePageMap,
     flowGroups,
+    annotationMoves,
     documentFlow: documentFlowEnabled,
     documentFlowPolicy: options.documentFlow === 'compatible-groups' ? 'compatible-groups' : documentFlowEnabled ? 'strict' : 'disabled',
   };
@@ -600,7 +603,7 @@ export async function editPdf(request, options = {}) {
   const qaCapture = captureConsole(!!options.includeEngineLog);
   let check;
   try {
-    check = await quality.inspectSavedPdf(engineFactory, sourceBytes, pdf, edits, { sourcePageMap, flowGroups, includeText: !!options.includeFlowText });
+    check = await quality.inspectSavedPdf(engineFactory, sourceBytes, pdf, edits, { sourcePageMap, flowGroups, annotationAdapter:options.annotationAdapter, includeText: !!options.includeFlowText });
   } catch (err) {
     report.selfCheck = { status: "error", error: err?.code ?? err?.name ?? "Error" };
     if (options.draft === true && readablePdf(pdf)) return finishDraft(report, pdf, sourceBytes, "SELF_CHECK_FAILED", "Saved-PDF self-check could not run");
