@@ -370,6 +370,7 @@ export async function editPdf(request, options = {}) {
         mutated = true;
         let committed;
         let lineLocal = null;
+        let publishedId = null;
         try {
           // Only a stepped commit (linePlan.breaks) can be undone here.
           const pre = linePlan?.breaks && localStable ? pageObjectList(engine) : null;
@@ -384,18 +385,25 @@ export async function editPdf(request, options = {}) {
           if (pre && lost) {
             const changed = new Set(touched.map((t) => t.index));
             const local = replaceReflowWithLineLocal(engine, paras, pi, del, inserts, runs, pre, changed);
-            if (local.lines) {
-              committed = local;
-              // The line-local commit rebuilt the page model, which renumbers
-              // its paragraphs; the page keeps the same paragraphs in order.
-              local.ids.forEach((id, j) => {
+            // A line-local commit and a declined prefix rollback both rebuild
+            // the page model, which renumbers every paragraph. The page keeps
+            // the same paragraphs in order, including ones edited later.
+            const applyIds = (ids) => {
+              if (!Array.isArray(ids)) return;
+              publishedId = ids[pi];
+              ids.forEach((id, j) => {
                 paras[j].id = id;
                 context.paras[j].id = id;
               });
-              for (const t of touched) t.id = local.ids[t.index];
+              for (const t of touched) t.id = ids[t.index];
+            };
+            if (local.lines) {
+              committed = local;
+              applyIds(local.ids);
             } else {
               committed = { upd: local.upd, lines: committed.lines };
               lineLocal = { status: "declined", reason: local.reason };
+              applyIds(local.ids);
             }
           }
         } catch (err) {
@@ -411,7 +419,7 @@ export async function editPdf(request, options = {}) {
         if (committed.lines?.status === "reflowed" && committed.lines.reason !== "line_count_changed") {
           report.warnings.push({ pageIndex, code: "source_lines_reflowed", paragraphIndex: pi, reason: committed.lines.reason, severity: "warning" });
         }
-        touched.push({ id: upd.id ?? para.id, index: pi, sourceBox: para.box, sourceLines: para.lines, sourceFormat: para.format });
+        touched.push({ id: publishedId ?? upd.id ?? para.id, index: pi, sourceBox: para.box, sourceLines: para.lines, sourceFormat: para.format });
       }
       if (reflow) {
         let r;

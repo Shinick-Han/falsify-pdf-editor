@@ -216,22 +216,23 @@ test("real engine: a last-line edit stays flush left and keeps the justified lin
   assert.ok(Math.abs(onLine(o, 455)[0].x - onLine(s, 455)[0].x) <= 0.1);
 });
 
-test("real engine: a line-local decline leaves exactly the plain re-layout (undo is complete)", { skip }, async () => {
+test("real engine: a middle-line overflow pins the prefix and reflows only the suffix", { skip }, async () => {
   const src = await justifiedPdf(ONE);
-  // Too long for its justified line, short enough to keep the line count.
+  // Too long for its justified line. The prefix line stays; the suffix reflows.
   const edits = [{ id: "w", pageIndex: 0, before: "the green", after: "the very green" }];
   const { pdf: out, report } = await run(src, edits);
+  assert.equal(report.ok, true, JSON.stringify(report.selfCheck?.failures));
   const row = report.pages[0].paragraphs[0];
-  assert.equal(row.lineLocal?.status, "declined");
-  assert.match(row.lineLocal.reason, /^(justification_out_of_range|edited_line_too_wide|edited_line_wraps)$/);
+  assert.equal(row.lineLocal, undefined);
   assert.equal(row.lineRetention.status, "reflowed");
-  assert.ok(report.warnings.some((w) => w.code === "source_lines_reflowed"));
-  const plain = await run(src, edits, plainFactory);
-  assert.equal(plain.report.ok, report.ok);
-  assert.deepEqual(plain.report.pages[0].paragraphs[0].lineRetention, row.lineRetention);
-  const [a, b] = [await glyphsOf(plain.pdf), await glyphsOf(out)];
-  assert.deepEqual(b.map((g) => [g.ch, g.font, g.x.toFixed(3), g.y.toFixed(3)]), a.map((g) => [g.ch, g.font, g.x.toFixed(3), g.y.toFixed(3)]));
-  assert.ok(lineText(b, 485).includes("theverygreen") || b.map((g) => g.ch).join("").includes("theverygreen"));
+  assert.equal(row.lineRetention.reason, "edited_line_overflows");
+  assert.equal(row.lineRetention.prefixKept, 1);
+  assert.equal(row.lineRetention.suffixReflow, true);
+  assert.ok(report.warnings.some((w) => w.code === "source_lines_reflowed" && w.reason === "edited_line_overflows"));
+  const [s, o] = [await glyphsOf(src), await glyphsOf(out)];
+  assertSameLine(s, o, 500);
+  assert.ok(o.every((g) => Math.abs(g.size - 11) <= 0.01 || g.y > 700 || g.y < 50));
+  assert.ok(lineText(o, 485).includes("very") || o.map((g) => g.ch).join("").includes("theverygreen"));
 });
 
 test("real engine: an undo that does not restore the page fails closed with STATE_DRIFT", { skip }, async () => {

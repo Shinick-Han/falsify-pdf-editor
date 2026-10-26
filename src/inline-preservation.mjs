@@ -604,6 +604,10 @@ export function commitLineLocal(engine, paras, pi, del, inserts, changed = new S
   let ws = 0;
   let justified = false;
   if (justify && spaces) {
+    // Already wider than the source line with no extra word spacing: squeezing
+    // it with a negative word spacing would change the source font. That is
+    // an overflow, so the prefix-preserving suffix reflow can run.
+    if (w0 > target + WIDTH_TOL) return restore("edited_line_too_wide");
     // The engine adds the word spacing to each space before the run's
     // horizontal scale, and measures spaces by the font (not the source
     // advance) once a word spacing is set: secant steps of slope
@@ -622,7 +626,9 @@ export function commitLineLocal(engine, paras, pi, del, inserts, changed = new S
     for (let j = 0; j + 1 < newLine.length; j++) {
       if (newLine[j] !== " ") continue;
       const gap = cx[j + 1] - cx[j];
-      if (!(gap >= LOCAL_JUSTIFY.min * size && gap <= LOCAL_JUSTIFY.max * size)) return restore(gap > 0 && gap < LOCAL_JUSTIFY.min * size ? "edited_line_too_wide" : "justification_out_of_range");
+      // A collapsed or too-tight space means the edited line does not fit.
+      // A gap above the justify range is a short line, not an overflow.
+      if (!(gap >= LOCAL_JUSTIFY.min * size && gap <= LOCAL_JUSTIFY.max * size)) return restore(gap <= LOCAL_JUSTIFY.min * size ? "edited_line_too_wide" : "justification_out_of_range");
     }
     justified = true;
   } else if (w0 > target + WIDTH_TOL) {
@@ -687,22 +693,429 @@ export function commitLineLocal(engine, paras, pi, del, inserts, changed = new S
   };
 }
 
+// An edit that stays on one source line but does not fit that line. The
+// line-local commit refuses these; the prefix commit below is the next try.
+const OVERFLOW_REASONS = new Set(["edited_line_wraps", "edited_line_too_wide"]);
+
+function sliceRuns(runs, from) {
+  const out = [];
+  let n = 0;
+  for (const r of runs) {
+    const a = Math.max(0, from - n);
+    n += r.text.length;
+    if (a >= r.text.length) continue;
+    const text = r.text.slice(a);
+    if (text) out.push({ ...r, text });
+  }
+  return out;
+}
+
+const lettersOf = (s) => s.replace(/\s+/g, "");
+// Physical type size: Tf times the upright text-matrix vertical scale.
+// A source glyph may be Tf 1 with matrix d 9.5, and a committed glyph Tf 9.5
+// with d 1. Without a finite upright matrix there is no physical size to
+// compare, so the caller declines instead of using raw Tf.
+const DRAWN_TOL = 0.02;
+const drawnSize = (g) => {
+  if (!Number.isFinite(g?.size) || !(g.size > 0)) return null;
+  if (!Number.isFinite(g?.vd) || !(g.vd > 0)) return null;
+  if (!Number.isFinite(g?.aspect)) return null;
+  return g.size * g.vd;
+};
+
+// Glyphs of these text objects, including U+0020, sorted so a prefix can be
+// compared object-for-object. Spaces are the signal a rebuilt line invented
+// a word break the source text object did not have.
+function collectGlyphs(engine, handles) {
+  const M = engine.M;
+  const own = new Set(handles.map((h) => h >>> 0));
+  const tp = M._FPDFText_LoadPage(engine.page);
+  const n = tp ? M._FPDFText_CountChars(tp) : 0;
+  const buf = M._malloc(192);
+  const matrix = typeof M._FPDFText_GetMatrix === "function";
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const u = M._FPDFText_GetUnicode(tp, i);
+    const h = M._FPDFText_GetTextObject(tp, i) >>> 0;
+    if (u < 32 || !own.has(h)) continue;
+    if (!M._FPDFText_GetCharOrigin(tp, i, buf, buf + 8)) continue;
+    const x = M.HEAPF64[buf >> 3], y = M.HEAPF64[(buf + 8) >> 3];
+    const len = M._FPDFText_GetFontInfo(tp, i, buf + 16, 128, buf + 144);
+    const font = len > 0 && len <= 128 ? M.UTF8ToString(buf + 16, 128) : null;
+    const size = M._FPDFText_GetFontSize(tp, i);
+    let aspect = null;
+    let vd = null;
+    if (matrix && M._FPDFText_GetMatrix(tp, i, buf + 160)) {
+      const [a, b, c, d] = [0, 1, 2, 3].map((j) => M.HEAPF32[((buf + 160) >> 2) + j]);
+      vd = d;
+      if (a > 0 && d > 0 && Math.abs(b) <= ASPECT_TOL * d && Math.abs(c) <= ASPECT_TOL * d) aspect = a / d;
+    }
+    out.push({ u, x, y, font, size, aspect, vd, h });
+  }
+  M._free(buf);
+  if (tp) M._FPDFText_ClosePage(tp);
+  out.sort((a, b) => a.y - b.y || a.x - b.x || a.u - b.u || a.h - b.h);
+  return out;
+}
+
+function sameGlyphs(a, b) {
+  if (a.length !== b.length) return { ok: false, max: Infinity };
+  let max = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = Math.max(Math.abs(a[i].x - b[i].x), Math.abs(a[i].y - b[i].y));
+    max = Math.max(max, d);
+    if (a[i].u !== b[i].u || a[i].h !== b[i].h || a[i].font !== b[i].font || Math.abs(a[i].size - b[i].size) > 0.01 || d > KEPT_LINE_TOL) return { ok: false, max };
+    const aspect = Number.isFinite(a[i].aspect) || Number.isFinite(b[i].aspect);
+    if (aspect && !(Number.isFinite(a[i].aspect) && Number.isFinite(b[i].aspect) && Math.abs(a[i].aspect - b[i].aspect) <= ASPECT_TOL)) return { ok: false, max };
+  }
+  return { ok: true, max };
+}
+
+/**
+ * Re-lays out the edited source line and every line after it, leaving every
+ * preceding line's text objects where they are. Used when the edit stays on
+ * one source line (editedLineSpan) but does not fit that line, so a one-line
+ * commit would wrap or overflow. The suffix objects are moved aside until
+ * the engine models them as their own paragraph, that paragraph is committed
+ * at the column width, and the new objects are put back with the edited
+ * line's source origin. Prefix glyphs, including U+0020, must match the
+ * source. A failed attempt is undone. { reason: "no_prefix" } when the edit
+ * is on the first line: there is nothing to pin, and the caller keeps the
+ * plain paragraph re-layout.
+ */
+export function commitPrefixSuffix(engine, paras, pi, del, inserts, runs, changed = new Set()) {
+  if (!canCommitLineLocal(engine)) return { reason: "engine_capability_missing" };
+  const para = paras[pi];
+  const fmt = para.format || {};
+  if (![0, 3].includes(fmt.align ?? 0) || fmt.dir || para.rotation || para.vertical) return { reason: "alignment_unsupported" };
+  const span = editedLineSpan(para, del, inserts);
+  if (!span || span.reason) return { reason: span?.reason ?? "line_geometry_missing" };
+  const { k, start } = span;
+  if (k === 0) return { reason: "no_prefix" };
+  const source = para.lines;
+  const M = engine.M;
+  const handles = (engine.paragraphObjects(para.id) || []).map((h) => h >>> 0);
+  const before = lineGlyphs(engine, handles, source);
+  if (before.slice(0, k).some((g) => !g.length) || before.slice(k).some((g) => !g.length)) return { reason: "prefix_objects_unresolved" };
+  const linesOf = new Map();
+  before.forEach((g, j) => g.forEach((c) => {
+    const on = linesOf.get(c.h) || new Set();
+    on.add(j);
+    linesOf.set(c.h, on);
+  }));
+  const prefix = [];
+  const suffix = [];
+  for (const h of handles) {
+    const on = linesOf.get(h);
+    if (on) {
+      const lines = [...on];
+      const inPrefix = lines.some((j) => j < k);
+      const inSuffix = lines.some((j) => j >= k);
+      if (inPrefix && inSuffix) return { reason: "prefix_objects_span_suffix" };
+      if (on.size !== 1 || M._FPDFPageObj_GetType(h) !== OBJ_TEXT) return { reason: inPrefix ? "prefix_objects_unresolved" : "suffix_objects_unresolved" };
+      (inPrefix ? prefix : suffix).push(h);
+      continue;
+    }
+    const b = engine.objectBounds(h);
+    if (!b) return { reason: "line_objects_unresolved" };
+    for (let j = k; j < source.length; j++) {
+      const em = Math.max(...before[j].map((c) => c.size));
+      if (b.y <= source[j].y + em && b.y + b.h >= source[j].y - 0.4 * em) return { reason: "line_decoration_present" };
+    }
+  }
+  if (!prefix.length || !suffix.length) return { reason: "prefix_objects_unresolved" };
+  const pageBefore = pageObjectList(engine);
+  const slots = suffix.map((h) => pageBefore.indexOf(h)).sort((a, b) => a - b);
+  if (slots[0] < 0 || slots.some((s, i) => s !== slots[0] + i)) return { reason: "suffix_objects_interleaved" };
+  const anchor = slots[0] > 0 ? pageBefore[slots[0] - 1] : null;
+  const suffixOrdered = slots.map((s) => pageBefore[s]);
+  const suffixSet = new Set(suffixOrdered);
+  const rights = source.map((l) => l.x + l.w).filter(Number.isFinite);
+  if (para.box && Number.isFinite(para.box.x) && Number.isFinite(para.box.w)) rights.push(para.box.x + para.box.w);
+  const right = Math.max(...rights);
+  const width = right - source[k].x;
+  if (!(width > 1)) return { reason: "suffix_width_unknown" };
+  const prefixBounds = prefix.map((h) => JSON.stringify(engine.objectBounds(h)));
+  const suffixBounds = suffixOrdered.map((h) => JSON.stringify(engine.objectBounds(h)));
+  const prefixGlyphs = collectGlyphs(engine, prefix);
+  const suffixGlyphs = collectGlyphs(engine, suffixOrdered);
+  const onEdited = suffixGlyphs.filter((g) => g.u > 32 && Math.abs(g.y - source[k].y) <= 1);
+  if (!prefixGlyphs.length || !onEdited.length) return { reason: "prefix_objects_unresolved" };
+  if (onEdited.some((g) => drawnSize(g) == null)) return { reason: "suffix_matrix_unavailable" };
+  // Already edited paragraphs no longer match the source runs in `paras`.
+  // Their objects and glyphs, read before this attempt moves anything, are
+  // the current page. Untouched paragraphs still have to match those runs.
+  const prior = new Map();
+  for (const j of changed) {
+    if (j === pi) continue;
+    const handles = (engine.paragraphObjects(paras[j].id) || []).map((h) => h >>> 0).sort((a, b) => a - b);
+    const glyphs = collectGlyphs(engine, handles);
+    if (!handles.length || !glyphs.length) return { reason: "page_model_changed" };
+    prior.set(j, { handles, glyphs });
+  }
+  const srcSizes = onEdited.map(drawnSize);
+  const srcSize = [...srcSizes].sort((a, b) => a - b)[srcSizes.length >> 1];
+  const flat = textOf(para);
+  const fullNew = runs.map((r) => r.text).join("");
+  const suffixRuns = sliceRuns(runs, start);
+  if (!suffixRuns.length || squash(flat.slice(0, start) + suffixRuns.map((r) => r.text).join("")) !== squash(fullNew)) return { reason: "edited_text_mismatch" };
+
+  let steps = 0;
+  const step = (label, fn) => {
+    const depth = engine.historyDepth().undo;
+    engine.historyBeginStep(label);
+    try {
+      return fn();
+    } finally {
+      engine.historyEndStep();
+      if (engine.historyDepth().undo > depth) steps++;
+    }
+  };
+  const restore = (reason) => {
+    const mutated = steps > 0;
+    for (; steps > 0; steps--) if (!engine.historyUndo()) throw new LineRetentionError("undo_failed");
+    const back = (engine.paragraphObjects(para.id) || []).map((h) => h >>> 0);
+    if (pageObjectList(engine).join(",") !== pageBefore.join(",")) throw new LineRetentionError("state_drift", { after: reason, part: "page_objects" });
+    if (back.join(",") !== handles.join(",")) throw new LineRetentionError("state_drift", { after: reason, part: "paragraph_objects" });
+    if (prefix.some((h, i) => JSON.stringify(engine.objectBounds(h)) !== prefixBounds[i])) throw new LineRetentionError("state_drift", { after: reason, part: "prefix_bounds" });
+    if (suffixOrdered.some((h, i) => JSON.stringify(engine.objectBounds(h)) !== suffixBounds[i])) throw new LineRetentionError("state_drift", { after: reason, part: "suffix_bounds" });
+    if (!sameGlyphs(prefixGlyphs, collectGlyphs(engine, prefix)).ok || !sameGlyphs(suffixGlyphs, collectGlyphs(engine, suffixOrdered)).ok) {
+      throw new LineRetentionError("state_drift", { after: reason, part: "glyph_restore" });
+    }
+    // The isolated commit can leave every paragraph id on this page pointing
+    // at a replaced native paragraph. The fallback commit uses the id that
+    // still owns these objects, and the caller republishes the whole id list
+    // after that commit.
+    let id = para.id;
+    let restored = null;
+    if (mutated) {
+      const snap = pageBefore.join(",");
+      const model = engine.buildModel();
+      if (pageObjectList(engine).join(",") !== snap) throw new LineRetentionError("state_drift", { after: reason, part: "page_objects_rebuilt" });
+      if (!modelMatches(engine, model, paras, pi, squash(textOf(paras[pi])), changed, prior)) {
+        throw new LineRetentionError("state_drift", { after: reason, part: "paragraph_id" });
+      }
+      const got = (engine.paragraphObjects(model[pi].id) || []).map((h) => h >>> 0).sort((a, b) => a - b);
+      const had = [...handles].sort((a, b) => a - b);
+      if (got.join(",") !== had.join(",")) throw new LineRetentionError("state_drift", { after: reason, part: "paragraph_objects" });
+      id = model[pi].id;
+      restored = model[pi];
+    }
+    return { reason, mutated, id, restored, prior };
+  };
+
+  const top = Math.max(...suffixOrdered.map((h) => {
+    const b = engine.objectBounds(h);
+    return b.y + b.h;
+  }));
+  const away = -(top + 200);
+  step("falsify-prefix-isolate", () => {
+    for (const h of suffixOrdered) {
+      engine.historyNoteMatrix(h);
+      engine.translateObject(h, 0, away);
+    }
+  });
+  if (steps !== 1) {
+    for (const h of suffixOrdered) engine.translateObject(h, 0, -away);
+    return restore("history_unavailable");
+  }
+  if (pageObjectList(engine).join(",") !== pageBefore.join(",")) throw new LineRetentionError("state_drift", { after: "prefix_isolate", part: "page_objects_rebuilt" });
+  const iso = engine.buildModel();
+  if (pageObjectList(engine).join(",") !== pageBefore.join(",")) throw new LineRetentionError("state_drift", { after: "prefix_isolate", part: "page_objects_rebuilt" });
+  const mine = iso.filter((q) => (engine.paragraphObjects(q.id) || []).some((h) => suffixSet.has(h >>> 0)));
+  if (mine.length !== 1) return restore("suffix_not_isolated");
+  const q = mine[0];
+  const qh = (engine.paragraphObjects(q.id) || []).map((h) => h >>> 0);
+  if (!q.editable || qh.length !== suffixOrdered.length || qh.some((h) => !suffixSet.has(h)) || prefix.some((h) => qh.includes(h))) return restore("suffix_not_isolated");
+  const suffixText = flat.slice(start);
+  const qText = textOf(q);
+  if (lettersOf(qText) !== lettersOf(suffixText)) return restore("isolated_text_mismatch");
+  const pRun = [];
+  para.runs.forEach((r, ri) => {
+    for (let o = 0; o < r.text.length; o++) pRun.push(ri);
+  });
+  const qRun = [];
+  q.runs.forEach((r, ri) => {
+    for (let o = 0; o < r.text.length; o++) qRun.push(ri);
+  });
+  let a = 0;
+  let b = 0;
+  while (a < suffixText.length && b < qText.length) {
+    if (/\s/.test(suffixText[a])) { a++; continue; }
+    if (/\s/.test(qText[b])) { b++; continue; }
+    if (suffixText[a] !== qText[b] || baseStyle(q.runs[qRun[b]]) !== baseStyle(para.runs[pRun[start + a]])) return restore(suffixText[a] !== qText[b] ? "isolated_text_mismatch" : "isolated_style_mismatch");
+    a++;
+    b++;
+  }
+  while (a < suffixText.length && /\s/.test(suffixText[a])) a++;
+  while (b < qText.length && /\s/.test(qText[b])) b++;
+  if (a !== suffixText.length || b !== qText.length) return restore("isolated_text_mismatch");
+
+  let id = q.id;
+  if (!(q.box?.w >= width - 0.5)) {
+    const rz = step("falsify-prefix-width", () => engine.resizeParagraph(id, width));
+    if (!rz) return restore("suffix_not_isolated");
+    id = rz.id ?? id;
+  }
+  const upd = step("falsify-prefix-suffix", () => engine.commitParagraph(id, suffixRuns, fmt));
+  if (!upd?.lines?.length || !["x", "y"].every((f) => Number.isFinite(upd.lines[0][f]))) return restore("suffix_commit_failed");
+  if (prefix.some((h, i) => JSON.stringify(engine.objectBounds(h)) !== prefixBounds[i])) return restore("prefix_objects_moved");
+  const fresh = (engine.paragraphObjects(upd.id ?? id) || []).map((h) => h >>> 0);
+  if (!fresh.length || fresh.some((h) => prefix.includes(h))) return restore("suffix_objects_unresolved");
+
+  const dx = source[k].x - upd.lines[0].x;
+  const dy = source[k].y - upd.lines[0].y;
+  let placed = true;
+  step("falsify-prefix-place", () => {
+    for (const h of fresh) {
+      engine.historyNoteMatrix(h);
+      engine.translateObject(h, dx, dy);
+    }
+    const cur = pageObjectList(engine);
+    let at = anchor === null ? 0 : cur.indexOf(anchor) + 1;
+    if (anchor !== null && at === 0) placed = false;
+    for (const h of [...fresh].sort((p, qh2) => cur.indexOf(p) - cur.indexOf(qh2))) {
+      if (!placed) break;
+      engine.historyNoteZOrder(h);
+      if (!M._FPDFPage_RemoveObject(engine.page, h)) placed = false;
+      else if (!M._FPDFPage_InsertObjectAtIndex(engine.page, h, at++)) {
+        M._FPDFPage_InsertObject?.(engine.page, h);
+        placed = false;
+      }
+    }
+  });
+  if (!placed) return restore("line_order_not_restored");
+  if (prefix.some((h, i) => JSON.stringify(engine.objectBounds(h)) !== prefixBounds[i])) return restore("prefix_objects_moved");
+
+  const after = engine.buildModel();
+  if (after.length !== paras.length || after.some((p, j) => j !== pi && !changed.has(j) && paraKey(p) !== paraKey(paras[j]))) return restore("page_model_changed");
+  const now = after[pi];
+  if (squash(textOf(now)) !== squash(fullNew)) return restore("edited_text_mismatch");
+  const nowHandles = (engine.paragraphObjects(now.id) || []).map((h) => h >>> 0);
+  const want = new Set([...prefix, ...fresh]);
+  if (nowHandles.length !== want.size || nowHandles.some((h) => !want.has(h))) return restore("paragraph_objects_changed");
+  const proof = sameGlyphs(prefixGlyphs, collectGlyphs(engine, prefix));
+  if (!proof.ok) return restore("kept_lines_moved");
+  const got = collectGlyphs(engine, fresh).filter((g) => g.u > 32);
+  if (!got.length || got.some((g) => drawnSize(g) == null)) return restore("suffix_matrix_unavailable");
+  if (got.some((g) => Math.abs(drawnSize(g) - srcSize) > DRAWN_TOL)) return restore("suffix_font_changed");
+  const topGlyphs = got.filter((g) => Math.abs(g.y - source[k].y) <= 0.5);
+  if (!topGlyphs.length || Math.abs(Math.min(...topGlyphs.map((g) => g.x)) - source[k].x) > PLACE_TOL) return restore("suffix_misplaced");
+  const inkRight = Math.max(...fresh.map((h) => {
+    const b = engine.objectBounds(h);
+    return b ? b.x + b.w : -Infinity;
+  }));
+  if (inkRight > right + 1) return restore("suffix_exceeds_column");
+  return {
+    upd: { ...now, surgical: false },
+    ids: after.map((p) => p.id),
+    lines: {
+      status: "reflowed",
+      reason: "edited_line_overflows",
+      prefixKept: k,
+      suffixReflow: true,
+      kept: k,
+      lines: now.lines?.length ?? null,
+      maxKeptShift: +proof.max.toFixed(4),
+    },
+  };
+}
+
 /**
  * Replaces the plain re-layout that commitRetainingLines just committed (the
  * last undo step; pre is the page object list before it) by a line-local
- * commit when one holds. Otherwise the plain re-layout is committed again
- * and { upd, reason } returned.
+ * commit when one holds. An overflow that line-local refuses is retried with
+ * the prefix lines pinned and only the edited line plus its suffix re-laid
+ * out. Otherwise the plain re-layout is committed again and { upd, reason }
+ * returned. A prefix attempt that cannot isolate the source objects records
+ * that reason and still falls back to the plain re-layout; it does not
+ * report the prefix as kept.
  */
+// The edited runs name font sources by index into the paragraph they were
+// built from. After a rollback the restored paragraph can split those runs
+// differently; each edited run follows the restored run that holds the same
+// source characters. A source run that lands in more than one restored run
+// is not guessed.
+// `expectPi` is the squashed text this paragraph should show. Paragraphs
+// already edited on this page are proved by the glyph snapshot taken before
+// the attempt, not by the stale source runs. Every other paragraph still
+// has to match those runs. An empty or moved snapshot fails closed.
+function modelMatches(engine, model, paras, pi, expectPi, changed, prior) {
+  if (!model || model.length !== paras.length) return false;
+  if (squash(textOf(model[pi])) !== expectPi) return false;
+  for (let j = 0; j < model.length; j++) {
+    if (j === pi) continue;
+    if (changed.has(j)) {
+      const snap = prior?.get(j);
+      if (!snap?.handles.length || !snap.glyphs.length) return false;
+      const got = (engine.paragraphObjects(model[j].id) || []).map((h) => h >>> 0).sort((a, b) => a - b);
+      if (got.join(",") !== snap.handles.join(",")) return false;
+      if (!sameGlyphs(snap.glyphs, collectGlyphs(engine, got)).ok) return false;
+      continue;
+    }
+    if (squash(textOf(model[j])) !== squash(textOf(paras[j]))) return false;
+  }
+  return true;
+}
+
+function rebindRuns(edited, original, restored) {
+  if (!restored) return edited;
+  if (original.length === restored.length && original.every((r, i) => r.text === restored[i].text)) return edited;
+  if (original.map((r) => r.text).join("") !== restored.map((r) => r.text).join("")) return null;
+  const at = [];
+  restored.forEach((r, i) => { for (let k = 0; k < r.text.length; k++) at.push(i); });
+  const from = [];
+  original.forEach((r, i) => { for (let k = 0; k < r.text.length; k++) from.push(i); });
+  const hits = new Map();
+  from.forEach((ri, off) => {
+    const set = hits.get(ri) ?? new Set();
+    set.add(at[off]);
+    hits.set(ri, set);
+  });
+  const out = [];
+  for (const r of edited) {
+    const targets = [...(hits.get(r.sourceIndex) ?? [])];
+    if (targets.length !== 1) return null;
+    out.push({ ...r, sourceIndex: targets[0] });
+  }
+  return out;
+}
+
 export function replaceReflowWithLineLocal(engine, paras, pi, del, inserts, runs, pre, changed) {
   const para = paras[pi];
   if (!engine.historyUndo()) throw new LineRetentionError("undo_failed");
   if (pageObjectList(engine).join(",") !== pre.join(",")) throw new LineRetentionError("state_drift");
   const local = commitLineLocal(engine, paras, pi, del, inserts, changed);
   if (local.upd) return local;
+  let reason = local.reason;
+  let id = para.id;
+  let commitRuns = runs;
+  let republish = false;
+  let prior = null;
+  if (OVERFLOW_REASONS.has(local.reason)) {
+    const prefix = commitPrefixSuffix(engine, paras, pi, del, inserts, runs, changed);
+    if (prefix.upd) return prefix;
+    if (prefix.reason && prefix.reason !== "no_prefix") reason = prefix.reason;
+    if (prefix.mutated && prefix.id != null) {
+      id = prefix.id;
+      republish = true;
+      prior = prefix.prior;
+      commitRuns = rebindRuns(runs, para.runs, prefix.restored?.runs);
+      if (!commitRuns) throw new LineRetentionError("state_drift", { after: prefix.reason, part: "font_source" });
+    }
+  }
   engine.historyBeginStep("falsify-inline-edit");
+  let upd;
   try {
-    return { reason: local.reason, upd: engine.commitParagraph(para.id, runs, para.format) };
+    upd = engine.commitParagraph(id, commitRuns, para.format);
   } finally {
     engine.historyEndStep();
   }
+  if (!upd || !republish) return { reason, upd };
+  const after = engine.buildModel();
+  const fullNew = squash(commitRuns.map((r) => r.text).join(""));
+  if (!modelMatches(engine, after, paras, pi, fullNew, changed, prior)) {
+    throw new LineRetentionError("state_drift", { after: reason, part: "paragraph_id" });
+  }
+  return { reason, upd, ids: after.map((p) => p.id) };
 }

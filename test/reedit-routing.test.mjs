@@ -158,22 +158,22 @@ test("mock count change: an edit inside one line reaches the verified line-local
   assert.deepEqual(exact(o), exact(await glyphsOf(direct.pdf)));
 });
 
-test("real engine: a longer edit that adds a line declines to exactly the plain re-layout", { skip }, async () => {
+test("real engine: a longer edit that adds a line keeps the prefix and reflows the suffix", { skip }, async () => {
   const src = await justifiedPdf([{ y: 500, lines: P3 }]);
   const edits = [{ id: "y", pageIndex: 0, before: "green bolt", after: "green and yellow bolt" }];
   const { pdf: out, report } = await run(src, edits);
+  assert.equal(report.ok, true, JSON.stringify(report.selfCheck?.failures));
   const row = report.pages[0].paragraphs[0];
-  assert.deepEqual(row.lineRetention, { status: "reflowed", reason: "line_count_changed" });
-  assert.equal(row.lineLocal?.status, "declined");
-  assert.match(row.lineLocal.reason, /^(justification_out_of_range|edited_line_too_wide|edited_line_wraps)$/);
+  assert.equal(row.lineLocal, undefined);
+  assert.equal(row.lineRetention.status, "reflowed");
+  assert.equal(row.lineRetention.reason, "edited_line_overflows");
+  assert.equal(row.lineRetention.prefixKept, 1);
+  assert.equal(row.lineRetention.suffixReflow, true);
+  assert.equal(row.lineRetention.lines, 5);
   assert.equal(row.committedLines, 5);
-  // Not forced onto one line, not shrunk: the plain re-layout, glyph for glyph.
-  const p = await run(src, edits, plain(rt0));
-  assert.equal(p.report.ok, report.ok);
-  assert.deepEqual(p.report.pages[0].paragraphs[0], withoutLocal(row));
-  assert.deepEqual(p.report.warnings, report.warnings);
-  const o = await glyphsOf(out);
-  assert.deepEqual(exact(o), exact(await glyphsOf(p.pdf)));
+  assert.ok(report.warnings.some((w) => w.code === "source_lines_reflowed" && w.reason === "edited_line_overflows"));
+  const [s, o] = [await glyphsOf(src), await glyphsOf(out)];
+  assertSameLine(s, o, 500);
   const body = o.filter((g) => g.y > 400 && g.y < 520);
   assert.equal(new Set(body.map((g) => g.y.toFixed(1))).size, 5);
   assert.ok(body.every((g) => Math.abs(g.size - 11) <= 0.01));

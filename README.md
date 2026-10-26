@@ -6,6 +6,8 @@ It reuses pinned BentoPDF source. By default it runs the committed editcore WASM
 
 ## Status
 
+Current source prerelease: [0.1.0-alpha.6](docs/RELEASE-alpha6.md), including prefix preservation and rollback for ordered edits.
+
 Alpha: not a general-purpose PDF editor or a production-quality guarantee. Layout, reading-order, and font coverage limitations must be tested for each document. An engine's successful save is not independent acceptance. The existing Workbench is not automatically connected to this module.
 
 An independent local C++ rebuild reproduced the supplied JS/WASM byte-for-byte. A second, patched build fixed the tested inserted-text stream-order failures. This is one host/build comparison, not a universal PDF quality guarantee. See [build provenance and instructions](docs/BUILD.md).
