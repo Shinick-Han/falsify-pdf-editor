@@ -16,8 +16,9 @@ with `id`, `pageIndex`, `before`, `after`. The input and request must be regular
 files; source/request/output/report must differ; output and report cannot exist.
 No harness, model, rationale, answer key, remote endpoint or executable is accepted.
 
-The companion owns the temporary directory. Node writes output only after the
-mandatory saved-document self-check passed. A sanitized report retains indices,
+The companion owns the temporary directory. Strict requests (no `draft` field,
+or `draft: false`) write the PDF only after the mandatory saved-document
+self-check passed. A sanitized report retains indices,
 counts, diagnostic codes, runtime digests and source-page mapping, not text or
 private paths. Public capability flags normalize `EDITOR_CAPABILITIES.pagination`
 through `.supported === true`; they describe supported scope, not guaranteed
@@ -39,6 +40,31 @@ report exposes only `{policy, applied: true, copiedPages}` after a passed
 self-check, with a positive count equal to the reported added-page count and
 at most 32. Source edge text, font handles and private paths are never published
 in this metadata. A missing capability keeps old companions compatible.
+
+## Explicit draft preservation
+
+`draft` is an optional boolean on `falsify-web-bridge-request/1`. Only `true`
+opts in. The CLI does not accept the field and remains strict: a failed
+self-check still writes no PDF.
+
+When `draft` is true and `editPdf` has already saved readable `%PDF-` bytes,
+a failed or errored self-check still writes those bytes and the report, then
+exits 1. Stdout is one object, `{ok:false, code, draft:true}`. The report keeps
+`ok: false`, `status: "draft"`, `quality` of `failed` or `error`, the machine
+`selfCheck.status`, `error.code`, per-edit statuses, `outputSha256`,
+`inputSha256` and the runtime digests. It is not rewritten to
+`self-check-passed` or `ok: true`. An edit whose After is absent
+(`after_missing`) is not left as `applied` or `noop`; its status is
+`after-missing`. A read-order failure such as
+`edited_page_text_or_order_mismatch` keeps the machine applied status when the
+After is present, while the export stays unsuccessful.
+
+Bytes are not invented. A failure before save, a missing file, or a payload
+that does not start with `%PDF-` still writes no output. Hash, runtime and
+source-hash checks stay with the companion. There is no fallback to another
+editor, white overlay or raster rewrite. `capabilities` advertises `draft: true`
+for this protocol; an older bridge rejects the unknown field instead of
+pretending the check passed.
 
 Alpha.3 integration checks: 80 module tests executed, zero failures/skips in the
 prepared coordinator environment; actual browser upload/edit/export produced

@@ -5,6 +5,7 @@
 // must match exactly once on its page after whitespace normalization; there
 // is no fuzzy relocation, implicit selection or shortening of After text.
 // All pages are planned against unchanged snapshots before any commit.
+import { createHash } from "node:crypto";
 import { loadRuntime } from "./runtime.mjs";
 import { PAGINATION_CAPABILITY, PAGINATION_LIMITS, paginateOverflow } from "./pagination.mjs";
 import {
@@ -256,9 +257,49 @@ function captureConsole(keepText) {
  * allowPagination (default true), maxNewPages (document-wide budget,
  * default 8, at most 32), includeFlowText (default false: expected flow
  * text is reported as sha256/length only),
+ * draft (default false; only the boolean true opts in),
  * quality / engineFactory (test seams).
  * Throws EditError on any definite failure; err.report carries diagnostics.
+ * Strict mode (draft not exactly true, including the CLI) still throws after
+ * a saved-file self-check failure and does not return those bytes.
+ * Draft mode returns the saved readable PDF with ok:false when the self-check
+ * fails or cannot run. It does not relabel that check as passed.
  */
+const sha256Bytes = (bytes) => createHash("sha256").update(bytes).digest("hex");
+
+// A saved file is readable here only when it is non-empty PDF bytes. Draft mode
+// never invents a document and never treats another payload as a PDF.
+function readablePdf(pdf) {
+  return pdf instanceof Uint8Array && pdf.length >= 5 && pdf[0] === 0x25 && pdf[1] === 0x50 && pdf[2] === 0x44 && pdf[3] === 0x46 && pdf[4] === 0x2d;
+}
+
+// After text that the self-check did not find must not keep a success status.
+function withholdAbsentAfter(report) {
+  const failures = Array.isArray(report.selfCheck?.failures) ? report.selfCheck.failures : [];
+  const missing = failures.filter((f) => f && f.code === "after_missing");
+  if (!missing.length) return;
+  const ids = new Set(missing.map((f) => f.id).filter((id) => typeof id === "string"));
+  const pages = new Set(missing.filter((f) => f.id == null && Number.isInteger(f.pageIndex)).map((f) => f.pageIndex));
+  const unlabeled = ids.size === 0 && pages.size === 0;
+  for (const row of report.edits) {
+    if ((unlabeled || ids.has(row.id) || pages.has(row.pageIndex)) && (row.status === "applied" || row.status === "noop")) row.status = "after-missing";
+  }
+}
+
+// Honest draft: the saved bytes stay, the check is not rewritten to passed,
+// and the export itself is not labeled successful.
+function finishDraft(report, pdf, sourceBytes, code, message) {
+  report.ok = false;
+  report.status = "draft";
+  report.draft = true;
+  report.quality = report.selfCheck?.status === "error" ? "error" : "failed";
+  withholdAbsentAfter(report);
+  report.inputSha256 = sha256Bytes(sourceBytes);
+  report.outputSha256 = sha256Bytes(pdf);
+  report.error = { code, message };
+  return { pdf, report };
+}
+
 export async function editPdf(request, options = {}) {
   const { sourceBytes, edits, reflow } = validateRequest(request, options.limits ?? LIMITS);
   const pg = paginationOptions(options);
@@ -500,6 +541,7 @@ export async function editPdf(request, options = {}) {
     check = await quality.inspectSavedPdf(engineFactory, sourceBytes, pdf, edits, { sourcePageMap, includeText: !!options.includeFlowText });
   } catch (err) {
     report.selfCheck = { status: "error", error: err?.code ?? err?.name ?? "Error" };
+    if (options.draft === true && readablePdf(pdf)) return finishDraft(report, pdf, sourceBytes, "SELF_CHECK_FAILED", "Saved-PDF self-check could not run");
     throw fail("SELF_CHECK_FAILED", "Saved-PDF self-check could not run");
   } finally {
     report.selfCheckLog = qaCapture.restore();
@@ -517,6 +559,11 @@ export async function editPdf(request, options = {}) {
       textEqual: row.text_equal === true,
     }));
   const unapplied = report.edits.filter((r) => r.status !== "applied" && r.status !== "noop");
+  // Draft keeps the already-saved PDF when the self-check failed. Strict mode
+  // still throws and drops those bytes. A passing check is unchanged.
+  if (options.draft === true && check?.ok !== true && readablePdf(pdf)) {
+    return finishDraft(report, pdf, sourceBytes, "SELF_CHECK_FAILED", "Saved-PDF self-check reported failures");
+  }
   if (unapplied.length) throw fail("EDIT_NOT_APPLIED", "Some requested edits were not applied", { ids: unapplied.map((r) => r.id) });
   if (check?.ok !== true) throw fail("SELF_CHECK_FAILED", "Saved-PDF self-check reported failures");
   if (added > 0 && sourcePageMap.every((m) => !m.continuationPageIndices.length || m.continuationStyle?.applied === true)) {

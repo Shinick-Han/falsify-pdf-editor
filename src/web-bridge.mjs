@@ -7,7 +7,10 @@
 // Stdout carries exactly one JSON object. Reports and capability output are
 // sanitized: no filesystem paths, engine logs, document text or messages
 // that could quote document content.
-// Exit codes: 0 ok, 1 edit/self-check/runtime failure, 2 usage or request error.
+// Exit codes: 0 ok, 1 edit/self-check/runtime failure (draft:true may still
+// have written a readable PDF), 2 usage or request error.
+// Strict mode writes the PDF only after a passed self-check. The request
+// field draft:true is the only opt-in that also keeps those bytes on failure.
 import { createHash } from "node:crypto";
 import { closeSync, lstatSync, openSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -18,7 +21,7 @@ import { CANDIDATE_ENV, loadRuntime } from "./runtime.mjs";
 export const ENGINE = "falsify-pdf-editor";
 export const REQUEST_SCHEMA = "falsify-web-bridge-request/1";
 export const BRIDGE_LIMITS = Object.freeze({ maxFileBytes: 25 * 1024 * 1024, maxEdits: 12, maxTextChars: 4000, maxRequestBytes: 512 * 1024 });
-const REQUEST_KEYS = ["schema", "input", "inputSha256", "edits", "reflow"];
+const REQUEST_KEYS = ["schema", "input", "inputSha256", "edits", "reflow", "draft"];
 const EDIT_KEYS = ["id", "pageIndex", "before", "after"];
 const CODE_RE = /^[A-Z][A-Z0-9_]{0,63}$/;
 const LOWER_CODE_RE = /^[a-z][a-z0-9_]{0,63}$/;
@@ -133,6 +136,8 @@ export async function capabilities({ env = process.env, load = loadRuntime, mod 
     ...editorCapabilities(m),
     limits: { ...BRIDGE_LIMITS, editorMaxFileBytes: m.LIMITS.maxFileBytes, editorMaxEdits: m.LIMITS.maxEdits },
     sourceUrl: pkg.sourceUrl,
+    // Explicit request field `draft: true` can keep a readable PDF after a failed self-check.
+    draft: true,
   };
 }
 
@@ -202,6 +207,7 @@ export function loadRequest(args) {
   if (names.some((n) => same(n, req.input))) bad("input must differ from request, output and report");
   if (!match(req.inputSha256, HEX64)) bad("inputSha256 must be a lowercase sha256");
   if (typeof req.reflow !== "boolean") bad("reflow must be a boolean");
+  if ("draft" in req && typeof req.draft !== "boolean") bad("draft must be a boolean");
   if (!Array.isArray(req.edits) || req.edits.length < 1 || req.edits.length > BRIDGE_LIMITS.maxEdits) bad(`edits must hold 1-${BRIDGE_LIMITS.maxEdits} entries`);
   req.edits.forEach((e, i) => {
     if (!e || typeof e !== "object" || Array.isArray(e)) bad(`Edit #${i} must be an object`);
@@ -218,7 +224,14 @@ export function loadRequest(args) {
   if (!ist.isFile() || ist.size < 1 || ist.size > BRIDGE_LIMITS.maxFileBytes) throw new BridgeError("INVALID_REQUEST", "Input PDF must be a regular file within the size budget");
   const sourceBytes = new Uint8Array(readFileSync(inputPath));
   if (sha256(sourceBytes) !== req.inputSha256) throw new BridgeError("INPUT_HASH_MISMATCH", "Input PDF does not match inputSha256");
-  return { sourceBytes, edits: req.edits.map((e) => ({ id: e.id, pageIndex: e.pageIndex, before: e.before, after: e.after })), reflow: req.reflow };
+  return {
+    sourceBytes,
+    edits: req.edits.map((e) => ({ id: e.id, pageIndex: e.pageIndex, before: e.before, after: e.after })),
+    reflow: req.reflow,
+    // Absent and false stay on the strict path. Only an explicit true opts in.
+    draft: req.draft === true,
+    inputSha256: req.inputSha256,
+  };
 }
 
 const list = (v, pick) => (Array.isArray(v) ? v.slice(0, 256).map(pick) : []);
@@ -288,6 +301,10 @@ export function sanitizeReport(report, extra = {}) {
     pageCount: pc ? { source: int(pc.source), output: int(pc.output) } : null,
     addedPages: count(r.pagination?.addedPages),
     sourcePageMap: sourcePageMap(r),
+    ...(r.draft === true && r.ok !== true && sc.status !== "passed" ? {
+      draft: true,
+      quality: sc.status === "error" ? "error" : "failed",
+    } : {}),
     ...(layoutVerified && r.pagination?.continuationStyle?.applied === true &&
       r.pagination.continuationStyle.policy === "source-number-suffix" &&
       count(r.pagination.continuationStyle.copiedPages) !== null &&
@@ -299,6 +316,34 @@ export function sanitizeReport(report, extra = {}) {
     independentQA: { status: "pending", note: "Same-engine self-check only; independent QA is still required." },
     ...extra,
   };
+}
+
+function readablePdf(pdf) {
+  return pdf instanceof Uint8Array && pdf.length >= 5 && pdf[0] === 0x25 && pdf[1] === 0x50 && pdf[2] === 0x44 && pdf[3] === 0x46 && pdf[4] === 0x2d;
+}
+
+// A failed self-check that still produced a readable PDF. A report that claims
+// success is not preserved and is not rewritten into a pass.
+function preservableDraft(loaded, result) {
+  if (loaded?.draft !== true) return false;
+  const r = result?.report;
+  if (!r || typeof r !== "object" || r.ok === true || r.status === "self-check-passed") return false;
+  const status = r.selfCheck?.status;
+  if (status !== "failed" && status !== "error") return false;
+  if (r.selfCheck?.ok === true) return false;
+  return readablePdf(result.pdf);
+}
+
+function withholdAbsentAfter(report) {
+  const failures = Array.isArray(report?.selfCheck?.failures) ? report.selfCheck.failures : [];
+  const missing = failures.filter((f) => f && f.code === "after_missing");
+  if (!missing.length || !Array.isArray(report.edits)) return;
+  const ids = new Set(missing.map((f) => f.id).filter((id) => typeof id === "string"));
+  const pages = new Set(missing.filter((f) => f.id == null && Number.isInteger(f.pageIndex)).map((f) => f.pageIndex));
+  const unlabeled = ids.size === 0 && pages.size === 0;
+  for (const row of report.edits) {
+    if (row && (unlabeled || ids.has(row.id) || pages.has(row.pageIndex)) && (row.status === "applied" || row.status === "noop")) row.status = "after-missing";
+  }
 }
 
 function writeExclusive(path, bytes) {
@@ -319,18 +364,45 @@ export async function main(argv, deps = {}) {
       out(JSON.stringify(await capabilities({ env, load: deps.loadRuntime, mod: deps.editor })));
       return 0;
     }
-    const req = loadRequest(args);
+    const loaded = loadRequest(args);
     requireCandidate(env);
     const edit = deps.editPdf ?? editor.editPdf;
     const caps = editorCapabilities(deps.editor);
+    const editInput = { sourceBytes: loaded.sourceBytes, edits: loaded.edits, reflow: loaded.reflow };
     let result;
     try {
-      result = await edit(req, {});
+      result = await edit(editInput, { draft: loaded.draft === true });
     } catch (e) {
       const report = sanitizeReport(e?.report, { error: sanitizeError(e), capabilities: caps });
       writeExclusive(args.report, JSON.stringify(report) + "\n");
       out(JSON.stringify({ ok: false, code: report.error.code }));
       return e instanceof editor.EditError && e.code === "INVALID_REQUEST" ? 2 : 1;
+    }
+    if (preservableDraft(loaded, result)) {
+      withholdAbsentAfter(result.report);
+      result.report.ok = false;
+      result.report.draft = true;
+      result.report.status = "draft";
+      if (result.report.quality !== "failed" && result.report.quality !== "error") {
+        result.report.quality = result.report.selfCheck.status === "error" ? "error" : "failed";
+      }
+      const code = match(result.report.error?.code, CODE_RE) ?? "SELF_CHECK_FAILED";
+      const message = result.report.selfCheck?.status === "error" ? "Saved-PDF self-check could not run" : "Saved-PDF self-check reported failures";
+      const report = sanitizeReport(result.report, {
+        outputSha256: sha256(result.pdf),
+        inputSha256: loaded.inputSha256,
+        error: { code, message },
+        capabilities: caps,
+      });
+      if (report.ok === true || report.selfCheck?.status === "passed" || report.layoutVerified === true) {
+        writeExclusive(args.report, JSON.stringify(sanitizeReport(result.report, { error: { code: "SELF_CHECK_FAILED", message: "Saved-PDF self-check did not pass" }, capabilities: caps })) + "\n");
+        out(JSON.stringify({ ok: false, code: "SELF_CHECK_FAILED" }));
+        return 1;
+      }
+      writeExclusive(args.out, result.pdf);
+      writeExclusive(args.report, JSON.stringify(report) + "\n");
+      out(JSON.stringify({ ok: false, code, draft: true }));
+      return 1;
     }
     if (result?.report?.ok !== true || result?.report?.selfCheck?.status !== "passed" || !(result.pdf instanceof Uint8Array) || result.pdf.length === 0) {
       const report = sanitizeReport(result?.report, { error: { code: "SELF_CHECK_FAILED", message: "Saved-PDF self-check did not pass" }, capabilities: caps });
@@ -338,7 +410,7 @@ export async function main(argv, deps = {}) {
       out(JSON.stringify({ ok: false, code: "SELF_CHECK_FAILED" }));
       return 1;
     }
-    // Output is written only after the self-check passed.
+    // Strict output is written only after the self-check passed.
     writeExclusive(args.out, result.pdf);
     writeExclusive(args.report, JSON.stringify(sanitizeReport(result.report, { outputSha256: sha256(result.pdf), capabilities: caps })) + "\n");
     out(JSON.stringify({ ok: true, code: "OK" }));
