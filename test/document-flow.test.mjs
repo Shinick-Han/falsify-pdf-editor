@@ -5,7 +5,7 @@ import { editPdf } from '../src/editor.mjs';
 import { planDocumentLines } from '../src/document-flow.mjs';
 import { inspectSavedPdf, capturePageLayout, expectedPageText } from '../src/quality.mjs';
 import { deriveDocumentFlowBand } from '../src/document-flow-band.mjs';
-import { deriveNativeLinkMoves, readLinkPageCharacters } from '../src/document-flow-links.mjs';
+import { deriveNativeLinkMoves, deriveNativeFitRMoves, readLinkPageCharacters } from '../src/document-flow-links.mjs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -210,6 +210,27 @@ test('native link association uses partial intersections and stable source range
   const editedLabel=[...target.slice(0,pages[0].length+at),...target.slice(pages[0].length+at+7)];
   assert.throws(()=>deriveNativeLinkMoves(source,bands,editedLabel,[{id:'label',pageIndex:1,before:'Another',after:''}],model,expectedPageText),e=>e.code==='document_flow_link_edited_label');
  } finally {source.close();}
+});
+
+test('FitR glyph association only accepts a wholly owned rigid source object',real,async()=>{
+ const source=await runtime.engineFactory(flowFixture());
+ try {
+  const bands=[0,1].map(i=>deriveDocumentFlowBand(source,i,capturePageLayout));
+  const pages=bands.map(b=>readLinkPageCharacters(source,b.sourcePageIndex).filter(c=>c.u>32&&c.box&&(c.box.b+c.box.t)/2>=b.floor-.5&&(c.box.b+c.box.t)/2<=b.bodyTop+.5));
+  const obj=pages[1][0].object,chars=pages[1].filter(c=>c.object===obj);
+  const rect=[Math.min(...chars.map(c=>c.box.l)),Math.min(...chars.map(c=>c.box.b)),Math.max(...chars.map(c=>c.box.r)),Math.max(...chars.map(c=>c.box.t))];
+  const d={id:1,kind:'FitR',targetSourcePageIndex:1,operands:rect};
+  const model={annotations:[{internalDestinations:[d]},{internalDestinations:[d]}]};
+  const target=pages.flatMap((cs,page)=>cs.map(c=>({...c,outputPageIndex:page?2:0,box:{l:c.box.l+3,r:c.box.r+3,b:c.box.b-28,t:c.box.t-28}})));
+  const moves=deriveNativeFitRMoves(source,bands,target,[],model,expectedPageText);
+  assert.equal(moves.length,1);assert.equal(moves[0].outputPageIndex,2);assert.ok(Math.abs(moves[0].dy+28)<.001);
+  const partial={annotations:[{internalDestinations:[{...d,operands:[rect[0]+1,...rect.slice(1)]}]}]};
+  assert.throws(()=>deriveNativeFitRMoves(source,bands,target,[],partial,expectedPageText),e=>e.code==='document_flow_destination_ownership_ambiguous');
+  const outside={annotations:[{internalDestinations:[{...d,operands:[rect[0]-10,rect[1],rect[2],rect[3]]}]}]};
+  assert.throws(()=>deriveNativeFitRMoves(source,bands,target,[],outside,expectedPageText),e=>e.code==='document_flow_destination_ownership_ambiguous');
+  const split=structuredClone(target);split[pages[0].length+1].outputPageIndex=3;
+  assert.throws(()=>deriveNativeFitRMoves(source,bands,split,[],model,expectedPageText),e=>e.code==='document_flow_destination_not_rigid');
+ }finally{source.close();}
 });
 
 // Optional app-owned raw dictionary adapter; explicit path injects the
