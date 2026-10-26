@@ -532,3 +532,18 @@ test("logical paragraph quote binds to the same raw source span as a visible lin
   for (const r of results) assert.deepEqual(r.failures,[]);
   assert.deepEqual(results[0].perPara,results[1].perPara);
 });
+
+
+test("visible and logical quote candidates form one deduplicated raw-span union before selecting a paragraph", () => {
+  const first=para(1,"beneficial",{lines:[{off:0}]});
+  const second=para(2,"ben\u0002 eficial",{lines:[{off:0},{off:5}]});
+  const edit={id:"ambiguous-logical",pageIndex:0,before:"beneficial",after:"harmful"};
+  assert.equal(canonicalParagraphText(second),edit.before);
+  const ambiguous=planPageEdits([first,second],[edit]);
+  assert.equal(ambiguous.failures[0].code,"AMBIGUOUS_MATCH");
+  assert.equal(ambiguous.failures[0].hits,2);
+  assert.equal(ambiguous.perPara.size,0);
+  const unique=planPageEdits([first],[edit]);
+  assert.deepEqual(unique.failures,[]);
+  assert.deepEqual(unique.plans[0].touched,[0]);
+});

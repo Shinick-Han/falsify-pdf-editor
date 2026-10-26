@@ -707,11 +707,15 @@ export function expectedPageText(sourceText, pageEdits) {
   const spans = [];
   for (const e of pageEdits) {
     const needle = normStr(e.before);
-    let text = matchText, map = matchMap;
-    let k = needle ? text.indexOf(needle) : -1;
-    if (k < 0) { text = logicalText; map = logicalMap; k = needle ? text.indexOf(needle) : -1; }
-    if (k < 0 || text.indexOf(needle, k + 1) >= 0) return { ok: false, id: e.id, reason: k < 0 ? "before_not_found" : "before_ambiguous" };
-    spans.push({ a: map[k], b: map[k + needle.length - 1] + 1, after: normStr(e.after), id: e.id });
+    const candidates = new Map();
+    for (const [text, map] of [[matchText, matchMap], [logicalText, logicalMap]]) {
+      for (let k = needle ? text.indexOf(needle) : -1; k >= 0; k = text.indexOf(needle, k + 1)) {
+        const a = map[k], b = map[k + needle.length - 1] + 1;
+        candidates.set(a + ":" + b, { a, b, after: normStr(e.after), id: e.id });
+      }
+    }
+    if (candidates.size !== 1) return { ok: false, id: e.id, reason: candidates.size ? "before_ambiguous" : "before_not_found" };
+    spans.push(candidates.values().next().value);
   }
   spans.sort((x, y) => x.a - y.a);
   for (let i = 1; i < spans.length; i++) {
@@ -1070,34 +1074,25 @@ function inspectContinued(s, o, out, m, pageEdits, row, failures, warnings, incl
     failures.push({ code: "expected_text_uncomputable", pageIndex: i, id: exp.id, reason: exp.reason });
   } else {
     row.text_equal = exp.text === got;
-    // PDFium can expose source discretionary hyphens as U+0002 and
-    // regenerated ones as a hyphen plus a line break. Normalize only the
-    // exact source word carrying that marker; all other hyphens stay real.
-    let expectedTypography = exp.text;
-    let outputTypography = got;
-    for (const match of exp.text.matchAll(/([\p{L}]+)\u0002\s*([\p{L}]+)/gu)) {
-      const word = match[1] + match[2];
-      expectedTypography = expectedTypography.replace(match[0], word);
-      outputTypography = outputTypography.replaceAll(match[0], word);
-    }
-    let at = 0;
-    const extraSpacesOnly = [...normStr(outputTypography)].every((ch) => {
-      if (ch === normStr(expectedTypography)[at]) { at++; return true; }
-      return ch === " ";
-    }) && at === normStr(expectedTypography).length;
-    if (!row.text_equal && extraSpacesOnly && pageEdits.every((e) => normStr(outputTypography).includes(normStr(e.after)))) {
-      row.text_equal = true;
-      row.typography_normalized = true;
-      warnings.push({ code: "continued_flow_source_typography_normalized", pageIndex: i, severity: "warning", detail: "Source discretionary hyphens and PDFium word spacing differ; character order and every requested After text are preserved" });
-    }
+    const sourceWords = new Set([...bandText(s, lo, flowHi).matchAll(/([\p{L}]+)\u0002\s*([\p{L}]+)/gu)].map((m) => m[1] + m[2]));
+    const expectedTypography = exp.text.replace(/([\p{L}]+)\u0002\s*([\p{L}]+)/gu, (raw, left, right) => sourceWords.has(left + right) ? left + right : raw);
     if (!row.text_equal) {
       const selected = (g, top) => g.chars.filter((c) => c.cy === null || c.cy >= lo && c.cy <= top);
       const actual = [selected(o, flowHi), ...conts.map((g) => selected(g, hi))]
         .flatMap((part, k) => k ? [{ u: 32, generated: true }, ...part] : part);
-      if (matchesGeneratedWhitespace(exp.text, actual)) {
+      // Remove an actual U+0002 and its line separator only for the exact
+      // discretionary word proven by the source. Keep each surviving
+      // character's generated-whitespace provenance; visible '-' is real.
+      const raw = actual.map((c) => String.fromCharCode(c.u)).join("");
+      const drop = new Set();
+      for (const match of raw.matchAll(/([\p{L}]+)\u0002\s*([\p{L}]+)/gu)) {
+        if (!sourceWords.has(match[1] + match[2])) continue;
+        for (let k = match.index + match[1].length; k < match.index + match[0].length - match[2].length; k++) drop.add(k);
+      }
+      if (matchesGeneratedWhitespace(expectedTypography, actual.filter((_, k) => !drop.has(k)))) {
         row.text_equal = true;
         row.generated_whitespace_normalized = true;
-        warnings.push({ code: "continued_flow_generated_whitespace_normalized", pageIndex: i, severity: "warning", detail: "Only PDFium-generated extraction whitespace differs; requested characters, literal whitespace and order are preserved" });
+        warnings.push({ code: "continued_flow_generated_whitespace_normalized", pageIndex: i, severity: "warning", detail: "Only source-proven discretionary markers and PDFium-generated extraction whitespace differ; requested characters, literal whitespace and order are preserved" });
       }
     }
     row.expected_text = digest(exp.text, includeText);

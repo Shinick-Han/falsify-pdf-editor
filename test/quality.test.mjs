@@ -358,3 +358,11 @@ test("generated extraction spaces may differ in a whole logical After; typed spa
   assert.equal(matchesGeneratedWhitespace("alpha beta",extracted("beta alpha")),false);
   assert.equal(matchesGeneratedWhitespace("value - 3",extracted("value~3")),false);
 });
+
+
+test("expected text rejects distinct visible/logical matches but deduplicates equivalent maps of one raw span", () => {
+  const edit={id:"logical",before:"beneficial",after:"harmful"};
+  assert.equal(expectedPageText("beneficial ben\u0002eficial",[edit]).reason,"before_ambiguous");
+  assert.deepEqual(expectedPageText("beneficial",[edit]),{ok:true,text:"harmful"});
+  assert.deepEqual(expectedPageText("ben\u0002eficial",[edit]),{ok:true,text:"harmful"});
+});

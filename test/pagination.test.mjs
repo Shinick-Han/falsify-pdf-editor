@@ -321,3 +321,19 @@ test("saved whole logical paragraph compares generated spaces across continuatio
     assert.ok(bad.failures.some(f=>f.code==="edited_flow_text_or_order_mismatch"),text);
   }
 });
+
+
+test("literal extra space in unchanged continued flow fails even while the requested word After exists", async () => {
+  const src=new Uint8Array([31]),out=new Uint8Array([32]);
+  const source=[[...body(["trial,routinely beta", "ben\u0002eficial delta"]),...footer],line("other page",50,700)];
+  const inspect=async(generated)=>{
+    const first=line("trial, routinely qualified",50,700);
+    first.find((c,i)=>i>0&&first[i-1][0]===","&&c[0]===" ")[3]=generated;
+    const docs=new Map([[src,source],[out,[[...first,br,...footer],body(["beneficial delta"]),line("other page",50,700)]]]);
+    return inspectSavedPdf(pdfEngineFor(docs),src,out,[{id:"word",pageIndex:0,before:"beta",after:"qualified"}],{sourcePageMap:mapFor([1])});
+  };
+  const bad=await inspect(false);
+  assert.ok(bad.failures.some(f=>f.code==="edited_flow_text_or_order_mismatch"));
+  const good=await inspect(true);
+  assert.equal(good.ok,true,JSON.stringify(good.failures));
+});

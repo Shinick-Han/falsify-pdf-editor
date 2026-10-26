@@ -190,18 +190,23 @@ export function planPageEdits(paras, edits) {
   const plans = [];
   for (const e of edits) {
     const needle = normalizeText(e.before);
-    let { norm, map } = visible;
-    let hits = findAll(norm, needle);
-    if (!hits.length) {
-      ({ norm, map } = logical);
-      hits = findAll(norm, needle);
+    // Both representations name raw source spans. Count their union before
+    // choosing a target: an exact visible hit must not hide a second
+    // paragraph whose source-proven discretionary spelling is equivalent.
+    const candidates = new Map();
+    for (const variant of [visible, logical]) {
+      for (const hit of findAll(variant.norm, needle)) {
+        const a = variant.map[hit][0], b = variant.map[hit + needle.length - 1][1];
+        const key = a + ":" + b;
+        if (!candidates.has(key)) candidates.set(key, { ...variant, hit, a, b });
+      }
     }
-    if (hits.length !== 1) {
-      failures.push({ id: e.id, pageIndex: e.pageIndex, code: hits.length ? "AMBIGUOUS_MATCH" : "NOT_FOUND", hits: hits.length });
+    if (candidates.size !== 1) {
+      failures.push({ id: e.id, pageIndex: e.pageIndex, code: candidates.size ? "AMBIGUOUS_MATCH" : "NOT_FOUND", hits: candidates.size });
       continue;
     }
-    const a = map[hits[0]][0];
-    const b = map[hits[0] + needle.length - 1][1];
+    const { map, hit, a, b } = candidates.values().next().value;
+    const hits = [hit];
     const overlap = spans.find((s) => !(b < s.a || a > s.b));
     if (overlap) {
       failures.push({ id: e.id, pageIndex: e.pageIndex, code: "OVERLAPPING_EDITS", with: overlap.id });
