@@ -103,17 +103,36 @@ function pageIndexMap(paras) {
   const chars = [];
   paras.forEach((p, pi) => {
     if (pi > 0) chars.push({ ch: "\n", pi: -1 });
+    let offset = 0;
+    const text = p.runs.map((r) => r.text).join("");
+    const starts = new Set((p.lines || []).map((l) => l.off));
     p.runs.forEach((r, ri) => {
-      for (let o = 0; o < r.text.length; o++) chars.push({ ch: r.text[o], pi, ri, o });
+      for (let o = 0; o < r.text.length; o++) {
+        const at = offset + o;
+        const lineEndHyphen = text[at] === "\u0002" && /\p{L}/u.test(text[at - 1] || "") && /\s/.test(text[at + 1] || "") && /\p{L}/u.test(text[at + 2] || "") && starts.has(at + 2);
+        chars.push({ ch: r.text[o], pi, ri, o, lineEndHyphen });
+      }
+      offset += r.text.length;
     });
   });
   return chars;
 }
 
-function normalizeChars(chars) {
+// Canonical selection text joins only source-proven discretionary line-end
+// hyphens. Literal hyphens/minus signs and unproven controls are untouched.
+export function sourceParagraphText(para) {
+  const chars = pageIndexMap([para]);
+  const drop = new Set(chars.flatMap((c,i) => c.lineEndHyphen ? [i,i+1] : []));
+  return chars.filter((_,i) => !drop.has(i)).map((c) => c.ch).join("");
+}
+
+export const canonicalParagraphText = sourceParagraphText;
+
+function normalizeChars(chars, logical = false) {
   let norm = "";
   const map = [];
   for (let i = 0; i < chars.length; i++) {
+    if (logical && chars[i].lineEndHyphen) { i++; continue; }
     if (/\s/.test(chars[i].ch)) {
       let j = i;
       while (j + 1 < chars.length && /\s/.test(chars[j + 1].ch)) j++;
@@ -121,7 +140,7 @@ function normalizeChars(chars) {
       map.push([i, j]);
       i = j;
     } else {
-      norm += chars[i].ch;
+      norm += chars[i].lineEndHyphen ? "-" : chars[i].ch;
       map.push([i, i]);
     }
   }
@@ -137,11 +156,19 @@ function findAll(norm, needle) {
 // breaks: optional "ri:o" keys of source whitespace written as hard breaks.
 export function rebuildRuns(para, del, inserts, breaks = null) {
   const out = [];
+  const sourceChars = !breaks ? pageIndexMap([para]) : [];
+  const discretionary = new Set();
+  sourceChars.forEach((c,i) => {
+    if (!c.lineEndHyphen) return;
+    discretionary.add(c.ri + ":" + c.o);
+    const next = sourceChars[i+1];
+    discretionary.add(next.ri + ":" + next.o);
+  });
   para.runs.forEach((r, ri) => {
     let t = "";
     for (let o = 0; o <= r.text.length; o++) {
       for (const ins of inserts) if (ins.ri === ri && ins.o === o) t += ins.text;
-      if (o < r.text.length && !del.has(ri + ":" + o)) t += breaks?.has(ri + ":" + o) ? "\n" : r.text[o];
+      if (o < r.text.length && !del.has(ri + ":" + o) && !discretionary.has(ri + ":" + o)) t += breaks?.has(ri + ":" + o) ? "\n" : r.text[o];
     }
     out.push({ ...r, text: t, rgba: r.rgba >>> 0, sourceIndex: ri });
   });
@@ -156,13 +183,19 @@ export function rebuildRuns(para, del, inserts, breaks = null) {
 // Returns { failures, plans, perPara }; failures carry no document text.
 export function planPageEdits(paras, edits) {
   const chars = pageIndexMap(paras);
-  const { norm, map } = normalizeChars(chars);
+  const visible = normalizeChars(chars);
+  const logical = normalizeChars(chars, true);
   const failures = [];
   const spans = [];
   const plans = [];
   for (const e of edits) {
     const needle = normalizeText(e.before);
-    const hits = findAll(norm, needle);
+    let { norm, map } = visible;
+    let hits = findAll(norm, needle);
+    if (!hits.length) {
+      ({ norm, map } = logical);
+      hits = findAll(norm, needle);
+    }
     if (hits.length !== 1) {
       failures.push({ id: e.id, pageIndex: e.pageIndex, code: hits.length ? "AMBIGUOUS_MATCH" : "NOT_FOUND", hits: hits.length });
       continue;
@@ -189,7 +222,7 @@ export function planPageEdits(paras, edits) {
       failures.push({ id: e.id, pageIndex: e.pageIndex, code: change.failure });
       continue;
     }
-    plans.push({ edit: e, span, touched, insertAt: span.find((c) => c.pi === lastPi), noop, change, start: a });
+    plans.push({ edit: e, span, touched, insertAt: span.find((c) => c.pi === lastPi), noop, change, start: a, sourceHyphenNormalization: span.some((c) => c.lineEndHyphen) });
   }
   // Paragraph mutations, built only from accepted, non-noop plans.
   const perPara = new Map();
@@ -386,6 +419,7 @@ export async function editPdf(request, options = {}) {
           status: p.noop ? "noop" : "planned",
           paragraphIndices: [...p.touched],
         });
+        if (p.sourceHyphenNormalization) report.warnings.push({ pageIndex, id: p.edit.id, code: "source_line_end_discretionary_hyphen_matched", severity: "info", evidence: "PDFium U+0002 followed by source line boundary", originalBefore: p.edit.before });
         if (p.change?.warning) report.warnings.push({ pageIndex, id: p.edit.id, code: p.change.warning, severity: "warning" });
       }
       if (plan.perPara.size === 0) continue;
@@ -521,7 +555,7 @@ export async function editPdf(request, options = {}) {
     const c = continued.get(s);
     const n = c?.added ?? 0;
     const entry = { sourcePageIndex: s, outputPageIndex: out, continuationPageIndices: Array.from({ length: n }, (_, k) => out + 1 + k) };
-    if (c) Object.assign(entry, { lineCounts: [...c.lineCounts], keptLines: c.keptLines, bodyTop: c.bodyTop, floor: c.floor });
+    if (c) Object.assign(entry, { lineCounts: [...c.lineCounts], keptLines: c.keptLines, bodyTop: c.bodyTop, ...(c.flowTop !== undefined ? { flowTop: c.flowTop } : {}), floor: c.floor });
     if (c?.continuationStyle) entry.continuationStyle = { version: c.continuationStyle.version, policy: c.continuationStyle.policy, applied: c.continuationStyle.applied === true };
     sourcePageMap.push(entry);
     out += 1 + n;

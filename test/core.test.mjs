@@ -6,7 +6,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir, homedir } from "node:os";
 import { join, parse } from "node:path";
 import { test } from "node:test";
-import { EditError, editPdf, planPageEdits, rebuildRuns, validateRequest } from "../src/editor.mjs";
+import { EditError, canonicalParagraphText, editPdf, planPageEdits, rebuildRuns, validateRequest } from "../src/editor.mjs";
 import { main } from "../src/cli.mjs";
 import { MODULE_ROOT, PINS, readVerifiedRuntime, resolveRuntimeDir, resolveSourceRoot, verifyAppSource } from "../src/runtime.mjs";
 import { prepareRuntime, validateModuleRoot } from "../scripts/prepare-runtime.mjs";
@@ -500,4 +500,35 @@ test("real engine: short edit commits and the saved text changes", { skip: !hasR
 test("module root default resolves to this package", () => {
   assert.ok(existsSync(join(MODULE_ROOT, "package.json")));
   assert.equal(JSON.parse(readFileSync(join(MODULE_ROOT, "package.json"), "utf8")).license, "AGPL-3.0-only");
+});
+
+
+test("only a source-proven discretionary line-end hyphen matches visible Before hyphen", () => {
+  const text="This prag\u0002 matic trial.";
+  const source=para(1,text,{lines:[{off:0,y:700},{off:11,y:686}]});
+  const edit={id:"hyphen",pageIndex:0,before:"This prag-\nmatic trial.",after:"This trial is qualified."};
+  const good=planPageEdits([source],[edit]);
+  assert.deepEqual(good.failures,[]);
+  assert.equal(good.plans[0].sourceHyphenNormalization,true);
+  assert.equal(good.plans[0].edit.before,edit.before);
+  assert.equal(planPageEdits([{...source,lines:[{off:0,y:700}]}],[edit]).failures[0].code,"NOT_FOUND");
+  assert.equal(planPageEdits([para(1,"This prag-matic trial.")],[edit]).failures[0].code,"NOT_FOUND");
+});
+
+
+test("full reflow joins only source-proven discretionary hyphens without changing run styles", () => {
+  const source=para(1,"This prag\u0002 matic well-known trial.",{lines:[{off:0,y:700},{off:11,y:686}]});
+  assert.equal(canonicalParagraphText(source),"This pragmatic well-known trial.");
+  assert.equal(rebuildRuns(source,new Set(),[]).map(r=>r.text).join(""),"This pragmatic well-known trial.");
+  assert.equal(rebuildRuns(source,new Set(),[])[0].sourceIndex,0);
+  assert.equal(canonicalParagraphText({...source,lines:[]}),source.runs[0].text);
+});
+
+
+test("logical paragraph quote binds to the same raw source span as a visible line-end hyphen", () => {
+  const source=para(1,"This prag\u0002 matic trial.",{lines:[{off:0,y:700},{off:11,y:686}]});
+  const changes=["This pragmatic trial.","This prag-\nmatic trial."];
+  const results=changes.map(before=>planPageEdits([source],[{id:"logical",pageIndex:0,before,after:"A qualified trial."}]));
+  for (const r of results) assert.deepEqual(r.failures,[]);
+  assert.deepEqual(results[0].perPara,results[1].perPara);
 });

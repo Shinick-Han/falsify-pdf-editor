@@ -371,3 +371,18 @@ test("real engine F2: with pagination disabled the overflow is an explicit refus
     (e) => e.code === "LAYOUT_UNSUPPORTED" && e.details.codes.includes("pagination_unsupported"),
   );
 });
+
+
+test("long publisher footer requires a separate page number on the same baseline", () => {
+  const { engine, model } = makeEngine();
+  const publisher = "PLOS ONE | DOI:10.1371/journal.pone.0161749 September 15, 2016 publication footer";
+  const footer = { ...model.find((p) => p.id === 9), id: 10, box: { x: 36, top: 40, w: 240, h: 14 }, runs: [{ text: publisher, size: 8 }] };
+  // The fixture need not add objects: classification relies on source
+  // geometry and baseline, with ownership still checked by pagination.
+  let ctx = capturePageLayout(engine, 0, [...model, footer]);
+  assert.equal(ctx.paras.find((p) => p.id === 10).role, "footer_uncertain");
+  ctx = capturePageLayout(engine, 0, [...model.filter((p) => p.id !== 9), footer]);
+  assert.equal(ctx.paras.find((p) => p.id === 10).role, "body");
+  ctx = capturePageLayout(engine, 0, [...model, { ...footer, lines: [{ y: 44 }] }]);
+  assert.equal(ctx.paras.find((p) => p.id === 10).role, "body");
+});

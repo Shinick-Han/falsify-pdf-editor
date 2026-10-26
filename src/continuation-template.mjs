@@ -8,7 +8,8 @@
 // source number plus a decimal suffix ("10.1", "10.2" ...) at the source
 // alignment anchor. Original edge objects are only read, never moved.
 //
-// Scope is text-only. Edge graphics, ambiguous numbers, off-baseline edge
+// Scope is text-only. Fixed artwork wholly inside the physical edge band
+// stays on the source page and is not repeated. Intruding graphics, ambiguous numbers, off-baseline edge
 // text and unencodable suffix glyphs are specific errors before anything is
 // cloned; every clone is proven against the source glyphs via FPDFText.
 // Contract: docs/PAGINATION.md.
@@ -31,6 +32,32 @@ export function classifyEdgeText(text) {
   if (/^\d+$/.test(t)) return "page_number";
   if (t && (NUMBER_LIKE.test(t) || LABELLED_NUMBER.test(t))) return "number_unsupported";
   return "running";
+}
+
+// Resolve only a spatially corroborated three-object footer fraction.
+// Return the denominator object, which is fixed running text, not another
+// source page number. Other multiple-number shapes remain ambiguous.
+export function resolvePageFraction(items) {
+  const nums = items.filter((i) => /^\d+$/.test(i.text.trim()));
+  const slash = items.filter((i) => i.text.trim() === "/");
+  if (slash.length !== 1) return null;
+  const d = slash[0];
+  const a = nums.filter((n) => n.bounds.r <= d.bounds.l + 0.5).sort((a,b) => b.bounds.r - a.bounds.r)[0];
+  const b = nums.filter((n) => n.bounds.l >= d.bounds.r - 0.5).sort((a,b) => a.bounds.l - b.bounds.l)[0];
+  if (!a || !b) return null;
+  const baseline = (i) => i.chars?.[0]?.oy;
+  if (![a, b, d].every((i) => Number.isFinite(baseline(i))) || Math.abs(baseline(a) - baseline(b)) > 0.5 || Math.abs(baseline(a) - baseline(d)) > 0.5) return null;
+  if (!(a.bounds.r <= d.bounds.l + 0.5 && d.bounds.r <= b.bounds.l + 0.5)) return null;
+  const size = a.bounds.t - a.bounds.b;
+  if (!(size > 0) || d.bounds.l - a.bounds.r > size || b.bounds.l - d.bounds.r > size || +a.text > +b.text || +a.text < 1) return null;
+  const fixedNumbers = new Set([b]);
+  // A publisher date can contain a standalone year. Corroborate the
+  // adjacent month/day objects; unrelated numeric headers stay ambiguous.
+  const row = items.filter((i) => Math.abs(baseline(i) - baseline(a)) <= 0.5).sort((a,b) => a.bounds.l - b.bounds.l);
+  for (let k = 2; k < row.length; k++) {
+    if (/^(19|20)\d{2}$/.test(row[k].text.trim()) && /^\d{1,2},$/.test(row[k-1].text.trim()) && /^(January|February|March|April|May|June|July|August|September|October|November|December)$/.test(row[k-2].text.trim()) && row[k].bounds.r < a.bounds.l) fixedNumbers.add(row[k]);
+  }
+  return { numerator: a, denominator: b, fixedNumbers };
 }
 
 export function continuationNumberText(source, ordinal) {
@@ -241,9 +268,18 @@ export function snapshotPageEdges(engine, floor, bodyTop, exclude = null) {
   const chars = charsByObject(M, page);
   const items = [];
   let skipped = 0;
+  let fixedGraphics = 0;
   for (const e of edges) {
     const at = { index: e.index };
-    if (M._FPDFPageObj_GetType(e.h) !== OBJ_TEXT) return fail("continuation_edge_graphics_unsupported", at);
+    if (M._FPDFPageObj_GetType(e.h) !== OBJ_TEXT) {
+      // Fixed publisher artwork stays on the source page. Only graphics
+      // wholly inside the physical edge band may be omitted on the text-
+      // only continuation; objects intruding into body space still refuse.
+      const b = e.bounds;
+      if (!(b.t <= pageH * 0.1 && b.t < floor || b.b >= pageH * 0.9 && b.b > bodyTop)) return fail("continuation_edge_graphics_unsupported", at);
+      fixedGraphics++;
+      continue;
+    }
     // A clone cannot be given the source clip path (no public setter), so a
     // clipped edge would be drawn unclipped. Runtimes without the clip-path
     // getters cannot detect this; see docs/PAGINATION.md, Known risks.
@@ -306,9 +342,13 @@ export function snapshotPageEdges(engine, floor, bodyTop, exclude = null) {
     Object.defineProperty(item, "textY", { value: ts[0].y });
     items.push(item);
   }
+  const fraction = resolvePageFraction(items);
+  if (fraction) for (const item of items) {
+    if (item.role === "page_number" && fraction.fixedNumbers.has(item)) item.role = "running";
+  }
   const numbers = new Set(items.filter((i) => i.role === "page_number").map((i) => i.text.trim()));
   if (numbers.size > 1) return fail("continuation_page_number_ambiguous");
-  const snap = { ok: true, code: null, version: CONTINUATION_STYLE.version, pageW, pageH, floor, bodyTop, skipped, items };
+  const snap = { ok: true, code: null, version: CONTINUATION_STYLE.version, pageW, pageH, floor, bodyTop, skipped, fixedGraphics, items };
   Object.defineProperty(snap, "order", { value: order });
   return snap;
 }

@@ -33,6 +33,7 @@ export const PAGINATION_CAPABILITY = Object.freeze({
   supported: true,
   scope: "single-column top-level body text flow below the edited paragraph on unrotated, uncropped pages",
   continuationPages: "same size as the source page, inserted directly after it; moved body lines plus source-style copies of the source page's header/footer text; a standalone Arabic page number becomes source number plus decimal suffix (10.1, 10.2); no synthesized label",
+  fixedEdgeGraphics: "graphics wholly within the physical edge band stay on the original page and are omitted on text-only continuations, with an explicit warning; body-intersecting graphics still refuse",
   sourcePageNumbers: "unchanged; existing page-number objects stay on their source page",
   continuationStyle: Object.freeze({ version: CONTINUATION_STYLE.version, policy: CONTINUATION_STYLE.policy }),
   downstreamPages: "never modified; only their output index shifts, see report.pagination.sourcePageMap",
@@ -231,7 +232,24 @@ export function buildFlowPlan(engine, ctx, grown, { floor, maxNewPages }) {
     if (b.x + b.w < anchor.x - 0.5 || b.x > anchor.x + anchor.w + 0.5) {
       return err("pagination_unsupported_multi_column_flow");
     }
-    if (M._FPDFPageObj_GetType(h) !== OBJ_TEXT) return err("pagination_unsupported_foreign_object_in_flow");
+    if (M._FPDFPageObj_GetType(h) !== OBJ_TEXT) {
+      // A short zero-height link underline is an inline decoration, not a
+      // foreign figure. Bind it only to one width-matching text object on
+      // the current line; tables, filled shapes and ambiguous marks refuse.
+      const hits = M._FPDFPageObj_GetType(h) === 2 && b.top - b.bottom <= EPS && b.w > EPS
+        ? lines.filter((line) => {
+          const size = ctx.paras.find((q) => q.id === line.para)?.size || 0;
+          const text = line.items.filter((it) => {
+            const cx = it.x + it.w / 2;
+            return cx >= b.x - 3 && cx <= b.x + b.w + 3 && it.bottom - b.top >= -1 && it.bottom - b.top <= 0.4 * size;
+          });
+          const single = text.some((it) => Math.abs(it.x - b.x) <= 1 && Math.abs(it.x + it.w - b.x - b.w) <= 1);
+          return size > 0 && b.w <= 2 * size && text.length && (single || Math.abs(Math.min(...text.map((it) => it.x)) - b.x) <= 3 && Math.abs(Math.max(...text.map((it) => it.x + it.w)) - b.x - b.w) <= 3);
+        }) : [];
+      if (hits.length !== 1) return err("pagination_unsupported_foreign_object_in_flow");
+      hits[0].items.push({ h, order: indexOf.get(h), ...b });
+      continue;
+    }
     const l = untouchedLines.find((x) => cy <= x.top + 0.5 && cy >= x.bottom - 0.5);
     if (l) {
       l.items.push({ h, order: indexOf.get(h), ...b });
@@ -255,7 +273,7 @@ export function buildFlowPlan(engine, ctx, grown, { floor, maxNewPages }) {
   const virtual = lines.map((l) => ({ top: l.top - l.shift, bottom: l.bottom - l.shift }));
   const split = planFlow(virtual, { bodyTop, floor, maxNewPages });
   if (!split.ok) return err(split.code, { line: split.line, maxNewPages: split.maxNewPages });
-  return { ok: true, lines, pages: split.pages, bodyTop, floor, orphans, objects };
+  return { ok: true, lines, pages: split.pages, bodyTop, flowTop, floor, orphans, objects };
 }
 
 const coded = (code) => Object.assign(new Error(code), { code });
@@ -391,8 +409,9 @@ export function paginateOverflow(engine, ctx, grown, { floor, maxNewPages }) {
     repairs.push({ kind: "pagination", action: "failed" });
     return { ok: false, warnings, repairs, added: 0 };
   }
+  if (edges?.fixedGraphics) warnings.push({ code: "continuation_fixed_edge_graphics_not_repeated", severity: "warning", count: edges.fixedGraphics, policy: "source-graphics-preserved-text-only-continuation" });
   if (plan.orphans) warnings.push({ code: "pagination_empty_objects_kept", severity: "info", count: plan.orphans });
   repairs.push({ kind: "pagination", action: r.added ? "continued" : "shifted", added: r.added, keptLines: r.keptLines, lineCounts: r.lineCounts, copiedEdges: r.copiedEdges, floor: +plan.floor.toFixed(2), bodyTop: +plan.bodyTop.toFixed(2) });
   const continuationStyle = r.added ? { version: CONTINUATION_STYLE.version, policy: CONTINUATION_STYLE.policy, applied: true } : undefined;
-  return { ok: true, warnings, repairs, added: r.added, lineCounts: r.lineCounts, keptLines: r.keptLines, bodyTop: plan.bodyTop, floor: plan.floor, continuationStyle };
+  return { ok: true, warnings, repairs, added: r.added, lineCounts: r.lineCounts, keptLines: r.keptLines, bodyTop: plan.bodyTop, flowTop: plan.flowTop, floor: plan.floor, continuationStyle };
 }

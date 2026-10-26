@@ -16,6 +16,7 @@
 // self-check, not an independent or rendering-based release check.
 
 import { createHash } from "node:crypto";
+import { resolvePageFraction } from "./continuation-template.mjs";
 
 const TOL = 1;
 const EDGE_BAND = 0.1;
@@ -103,6 +104,13 @@ export function capturePageLayout(engine, pageIndex, paragraphs) {
       topLevel: slots.length === handles.length,
     };
   });
+  // A publisher footer can exceed the short-text heuristic. Require a
+  // separate page number on its baseline inside the bottom edge band.
+  const numbers = paras.filter((q) => q.role === "page_number" && q.box?.top <= edgeBottomY + pageH * EDGE_BAND);
+  for (const q of paras) {
+    if (q.role !== "body" || !q.box || q.baselines.length !== 1 || q.box.top > edgeBottomY + pageH * EDGE_BAND) continue;
+    if (numbers.some((n) => n.id !== q.id && n.baselines.some((y) => Math.abs(y - q.baselines[0]) <= 0.5) && hOverlap(n.box, q.box) <= 0)) q.role = "footer_uncertain";
+  }
   return { pageIndex, pageW, pageH, objects, types, paras };
 }
 
@@ -307,7 +315,7 @@ export function repairPageLayout(engine, pageIndex, context, touched, options = 
   repairs.push(...(p?.repairs ?? []));
   warnings.push(...(p?.warnings ?? []));
   if (!p?.ok) return { repairs, warnings, pagination: null };
-  const pagination = { added: p.added, lineCounts: p.lineCounts, keptLines: p.keptLines, bodyTop: p.bodyTop, floor: p.floor };
+  const pagination = { added: p.added, lineCounts: p.lineCounts, keptLines: p.keptLines, bodyTop: p.bodyTop, ...(p.flowTop !== undefined ? { flowTop: p.flowTop } : {}), floor: p.floor };
   if (p.continuationStyle !== undefined) {
     if (!validContinuationStyle(p.continuationStyle)) {
       warnings.push({ code: "continuation_style_invalid", pageIndex, severity: "error" });
@@ -683,12 +691,27 @@ function extents(g) {
 // Apply each edit once to the whitespace-normalized source page text.
 export function expectedPageText(sourceText, pageEdits) {
   const norm = normStr(sourceText);
+  let matchText = "";
+  const matchMap = [];
+  for (let i = 0; i < norm.length; i++) {
+    const expanded = norm[i] === "\u0002" ? (norm[i + 1] === " " ? "-" : "- ") : norm[i];
+    matchText += expanded;
+    for (let j = 0; j < expanded.length; j++) matchMap.push(i);
+  }
+  let logicalText = "";
+  const logicalMap = [];
+  for (let i = 0; i < norm.length; i++) {
+    if (norm[i] === "\u0002") { if (norm[i+1] === " ") i++; continue; }
+    logicalText += norm[i]; logicalMap.push(i);
+  }
   const spans = [];
   for (const e of pageEdits) {
     const needle = normStr(e.before);
-    const k = needle ? norm.indexOf(needle) : -1;
-    if (k < 0 || norm.indexOf(needle, k + 1) >= 0) return { ok: false, id: e.id, reason: k < 0 ? "before_not_found" : "before_ambiguous" };
-    spans.push({ a: k, b: k + needle.length, after: normStr(e.after), id: e.id });
+    let text = matchText, map = matchMap;
+    let k = needle ? text.indexOf(needle) : -1;
+    if (k < 0) { text = logicalText; map = logicalMap; k = needle ? text.indexOf(needle) : -1; }
+    if (k < 0 || text.indexOf(needle, k + 1) >= 0) return { ok: false, id: e.id, reason: k < 0 ? "before_not_found" : "before_ambiguous" };
+    spans.push({ a: map[k], b: map[k + needle.length - 1] + 1, after: normStr(e.after), id: e.id });
   }
   spans.sort((x, y) => x.a - y.a);
   for (let i = 1; i < spans.length; i++) {
@@ -817,6 +840,7 @@ export function normalizePageMap(map, sourcePageCount) {
       next++;
     }
     if (cont.length && !(Number.isFinite(m.bodyTop) && Number.isFinite(m.floor) && m.bodyTop > m.floor)) return null;
+    if (m.flowTop !== undefined && !(cont.length && Number.isFinite(m.flowTop) && m.flowTop > m.floor && m.flowTop <= m.bodyTop + 2)) return null;
     if (cont.length && !(Array.isArray(m.lineCounts) && m.lineCounts.length === cont.length)) return null;
     if (m.continuationStyle !== undefined && !(cont.length && validContinuationStyle(m.continuationStyle))) return null;
     out.push({ ...m, continuationPageIndices: [...cont] });
@@ -867,7 +891,9 @@ const textOf = (cs) => String.fromCharCode(...cs.map((c) => c.u));
 // Source page numbers: edge text objects whose visible glyphs are only
 // Arabic digits. Two such objects with different values are ambiguous.
 function sourcePageNumbers(es) {
-  const items = byObject(es).filter((cs) => /^\d+$/.test(textOf(cs))).map((cs) => ({ glyphs: cs, text: textOf(cs) }));
+  const groups = byObject(es).map((cs) => ({ glyphs: cs, text: textOf(cs), chars: cs.map((c) => ({ oy: c.oy ?? c.b })), bounds: { l: Math.min(...cs.map((c) => c.l)), r: Math.max(...cs.map((c) => c.r)), b: Math.min(...cs.map((c) => c.b)), t: Math.max(...cs.map((c) => c.t)) }, style: cs[0]?.style }));
+  const fraction = resolvePageFraction(groups);
+  const items = groups.filter((g) => /^\d+$/.test(g.text) && !fraction?.fixedNumbers.has(g));
   return { items, ambiguous: new Set(items.map((x) => x.text)).size > 1 };
 }
 
@@ -999,11 +1025,18 @@ function inspectContinued(s, o, out, m, pageEdits, row, failures, warnings, incl
   const i = row.pageIndex;
   const { floor, bodyTop } = m;
   const lo = floor - 0.5, hi = bodyTop + 0.5;
-  const exp = expectedPageText(bandText(s, lo, hi), pageEdits);
+  const flowHi = m.flowTop === undefined ? hi : Math.min(hi, m.flowTop + 0.5);
+  const exp = expectedPageText(bandText(s, lo, flowHi), pageEdits);
+  if (flowHi < hi) {
+    const fixed = (g) => g.glyphs.filter((c) => c.b + (c.t - c.b) / 2 > flowHi && c.b + (c.t - c.b) / 2 <= hi);
+    const a = fixed(s), b = fixed(o);
+    row.fixed_body_stable = sameGlyphs(a, b) && sameStyles(a, b);
+    if (!row.fixed_body_stable) failures.push({ code: "fixed_body_above_flow_changed", pageIndex: i });
+  }
   const conts = m.continuationPageIndices.map((k) => readGlyphs(out, k));
   // Every page of the flow is compared by its body band only; anything a
   // continuation page carries outside the band is checked as edge content.
-  const parts = [o, ...conts].map((g) => normStr(bandText(g, lo, hi)));
+  const parts = [normStr(bandText(o, lo, flowHi)), ...conts.map((g) => normStr(bandText(g, lo, hi)))];
   const joined = joinFlowParts(parts, exp.ok ? exp.text : "");
   const got = joined.text;
   row.body_band = { floor: +floor.toFixed(2), bodyTop: +bodyTop.toFixed(2) };
@@ -1012,6 +1045,26 @@ function inspectContinued(s, o, out, m, pageEdits, row, failures, warnings, incl
     failures.push({ code: "expected_text_uncomputable", pageIndex: i, id: exp.id, reason: exp.reason });
   } else {
     row.text_equal = exp.text === got;
+    // PDFium can expose source discretionary hyphens as U+0002 and
+    // regenerated ones as a hyphen plus a line break. Normalize only the
+    // exact source word carrying that marker; all other hyphens stay real.
+    let expectedTypography = exp.text;
+    let outputTypography = got;
+    for (const match of exp.text.matchAll(/([\p{L}]+)\u0002\s*([\p{L}]+)/gu)) {
+      const word = match[1] + match[2];
+      expectedTypography = expectedTypography.replace(match[0], word);
+      outputTypography = outputTypography.replaceAll(match[0], word);
+    }
+    let at = 0;
+    const extraSpacesOnly = [...normStr(outputTypography)].every((ch) => {
+      if (ch === normStr(expectedTypography)[at]) { at++; return true; }
+      return ch === " ";
+    }) && at === normStr(expectedTypography).length;
+    if (!row.text_equal && extraSpacesOnly && pageEdits.every((e) => normStr(outputTypography).includes(normStr(e.after)))) {
+      row.text_equal = true;
+      row.typography_normalized = true;
+      warnings.push({ code: "continued_flow_source_typography_normalized", pageIndex: i, severity: "warning", detail: "Source discretionary hyphens and PDFium word spacing differ; character order and every requested After text are preserved" });
+    }
     row.expected_text = digest(exp.text, includeText);
     row.output_parts = parts.map((p) => digest(p, includeText));
     if (!row.text_equal) failures.push({ code: "edited_flow_text_or_order_mismatch", pageIndex: i });

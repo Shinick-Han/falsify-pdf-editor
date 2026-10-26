@@ -64,7 +64,7 @@ advances, shifted so its inked extent keeps the source anchor (centre within
 left half). Original edge objects are only read.
 
 Fail-closed codes (severity error, no PDF): `continuation_edge_graphics_unsupported`
-(path/image/shading/form in an edge zone), `continuation_edge_clip_unsupported`
+(path/image/shading/form intruding beyond the physical edge zone), `continuation_edge_clip_unsupported`
 (edge text with a clip path), `continuation_edge_text_layout_unsupported`
 (chars off one text-space baseline, missing origin/box),
 `continuation_edge_style_unsupported` (blend mode / soft mask),
@@ -208,3 +208,57 @@ downstream page contents are never modified.
   matched, but Poppler's raster differed. An isolated page-box restore and
   reverse-perturb control reproduced/eliminated the effect. No universal
   byte-exact geometry or cross-renderer pixel-identity claim is made.
+
+
+## Publisher-page paragraph reflow (2026-10-27)
+
+Long single-line publisher footers can exceed the short-text heuristic. A
+separate page-number paragraph on the same baseline within the physical
+bottom band corroborates them as fixed footer text. This prevents their
+left margin from being mistaken for a second body column.
+
+A spatially adjacent three-object fraction (`7`, `/`, `15`) on one baseline
+uses `7.1 / 15` on the first continuation: the numerator keeps its right
+anchor, the separator and denominator keep their exact source style and
+positions. A separate publisher year is fixed only when adjacent month/day
+objects corroborate it. Other numeric candidates still fail as ambiguous.
+
+Fixed graphics wholly inside the physical top/bottom 10% edge band remain
+on their original page and are omitted on text-only continuations, with
+`continuation_fixed_edge_graphics_not_repeated`. Graphics intruding into
+the body remain unsupported. Short zero-height inline underline paths can
+travel with a unique width-matching body text line; table rules, filled
+shapes and ambiguous marks remain unsupported. Link annotation actions are
+not migrated by this object-based flow.
+
+`sourcePageMap[].flowTop` optionally identifies the top of the edited body
+flow separately from `bodyTop`. Text above it, including table text, must
+stay at its exact original glyph positions/styles. Only the body below it
+is concatenated with continuation text for order verification. This avoids
+misreading a PDF's original table/body content-stream order as an appendix.
+
+Before matching accepts a visible hyphen for PDFium's U+0002 discretionary
+hyphen only when the source paragraph proves a letter, the marker, one
+whitespace character, and a letter at the next source line's `off`. The
+original Before remains in the request/report. No literal hyphen is removed.
+Saved-flow verification separately reports source typography normalization:
+source-marked discretionary hyphens are joined before full reflow;
+PDFium may expose additional word spacing after reflow. The saved check
+does not erase visible output hyphens to hide a misspelled word.
+Every non-space character must remain in order, existing word spaces must
+remain, and every requested After must occur with its requested word spaces.
+This warning does not establish typographic identity or independent visual QA.
+
+
+Independent local acceptance found a remaining renderer limitation on the
+cold-shower paper: all 139 source-page vector drawings retained their
+geometry and widths, but PDFium regeneration changed 137 table-rule fills
+from source ICC-derived RGB approximately (0.581415, 0.589273, 0.599481) to
+8-bit DeviceRGB (0.576471, 0.588235, 0.596078). This produces a small visible
+pixel difference on the edited page. Public colour setters only expose
+8-bit RGBA; exact original ICC/stream preservation is not guaranteed by
+this repair. Unmodified source pages remain untouched.
+
+`sourceParagraphText(paragraph)` exports source-proven logical selection text
+for adapters, leaving raw runs for geometry/style. Both logical quotes and
+visible line-end-hyphen quotes bind to the original raw character spans.

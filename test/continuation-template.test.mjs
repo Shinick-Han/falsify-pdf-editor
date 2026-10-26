@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { editPdf } from "../src/editor.mjs";
 import {
   anchorOf,
+  resolvePageFraction,
   applyPageEdges,
   classifyEdgeText,
   continuationNumberText,
@@ -218,7 +219,7 @@ test("real engine: tampered clone is caught by verifyPageEdges", { skip }, async
 test("real engine: unsupported edges fail closed with specific codes", { skip }, async () => {
   const rows = body(rowsWithTarget());
   const cases = [
-    [`0 0 0 RG 72 770 m 540 770 l S ${rows} ${footer("10")}`, "continuation_edge_graphics_unsupported"],
+    [`0 0 0 RG 72 700 m 540 810 l S ${rows} ${footer("10")}`, "continuation_edge_graphics_unsupported"],
     [`${rows} ${footer("Page 3")}`, "continuation_page_number_unsupported"],
     [`${rows} ${footer("xii")}`, "continuation_page_number_unsupported"],
     [`BT /F2 10 Tf 300 770 Td (3) Tj ET ${rows} ${footer("4")}`, "continuation_page_number_ambiguous"],
@@ -290,4 +291,25 @@ test("real engine: editPdf copies source-style edges onto continuation pages", {
     out.close();
     srcEngine.close();
   }
+});
+
+
+test("fraction footer resolves only adjacent same-baseline numerator/slash/denominator", () => {
+  const item = (text, l, r, oy=30) => ({ text, bounds: { l, r, b: oy, t: oy+8 }, chars: [{ oy }], style: { size: 1 } });
+  const a=item("7",550,554), slash=item("/",556,559), b=item("15",561,569);
+  const r=resolvePageFraction([a,slash,b]);
+  assert.equal(r.numerator,a); assert.equal(r.denominator,b);
+  assert.equal(resolvePageFraction([a,slash,{...b,chars:[{oy:45}]}]),null);
+  assert.equal(resolvePageFraction([a,slash,item("15",580,588)]),null);
+  assert.equal(resolvePageFraction([a,slash,b,item("/",400,402)]),null);
+});
+
+test("real engine: fixed physical edge artwork stays on source and is omitted on text continuation", { skip }, async () => {
+  const content=`0 0 0 RG 72 770 m 540 770 l S ${body(rowsWithTarget())} ${footer("10")}`;
+  await withPage(pdfFromPages([content]), (engine) => {
+    const before=engine.M._FPDFPage_CountObjects(engine.page);
+    const snap=snapshotPageEdges(engine,50,750);
+    assert.equal(snap.ok,true); assert.equal(snap.fixedGraphics,1);
+    assert.equal(engine.M._FPDFPage_CountObjects(engine.page),before);
+  });
 });

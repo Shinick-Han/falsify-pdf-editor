@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EDITOR_CAPABILITIES, editPdf } from "../src/editor.mjs";
-import { PAGINATION_LIMITS, groupLines, planFlow } from "../src/pagination.mjs";
+import { PAGINATION_LIMITS, buildFlowPlan, groupLines, planFlow } from "../src/pagination.mjs";
 import { countGlyphLines, inspectSavedPdf, joinFlowParts, normalizePageMap } from "../src/quality.mjs";
 import { loadRuntime } from "../src/runtime.mjs";
 
@@ -283,4 +283,18 @@ test("real engine: long edit continues onto a new page with mapped, unchanged se
   const capped = editPdf({ sourceBytes: src, edits: [{ id: "long", pageIndex: 0, before: "If every check passes, we continue.", after }], reflow: true }, { maxNewPages: 0 });
   await assert.rejects(capped, { code: "PAGINATION_LIMIT" });
   assert.equal(Buffer.compare(copy, Buffer.from(src)), 0);
+});
+
+
+test("pagination binds a unique short inline underline but refuses table rules and filled shapes", () => {
+  const q={id:1,role:"body",editable:true,topLevel:true,box:{x:50,top:700,w:100,h:20},size:10};
+  const objects=[{h:1,type:1,b:{x:50,y:680,w:10,h:10}},{h:2,type:2,b:{x:50,y:678,w:10,h:0}}];
+  const engine={page:1,pageHeight:800,M:{_FPDFPage_CountObjects:()=>objects.length,_FPDFPage_GetObject:(_,i)=>objects[i].h,_FPDFPageObj_GetType:(h)=>objects.find(o=>o.h===h).type},paragraphObjects:()=>[1],objectBounds:(h)=>objects.find(o=>o.h===h).b};
+  const plan=()=>buildFlowPlan(engine,{paras:[q],pageH:800},[{id:1,box:q.box,delta:0}],{floor:50,maxNewPages:8});
+  assert.equal(plan().ok,true);
+  assert.deepEqual(plan().lines[0].items.map(i=>i.h),[1,2]);
+  objects[1].b.w=100;
+  assert.equal(plan().code,"pagination_unsupported_foreign_object_in_flow");
+  objects[1].b.w=10;objects[1].b.h=3;
+  assert.equal(plan().code,"pagination_unsupported_foreign_object_in_flow");
 });
