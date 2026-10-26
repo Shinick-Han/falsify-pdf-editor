@@ -4,7 +4,7 @@ import { loadRuntime } from '../src/runtime.mjs';
 import { editPdf } from '../src/editor.mjs';
 import { planDocumentLines } from '../src/document-flow.mjs';
 import { inspectSavedPdf, capturePageLayout, expectedPageText } from '../src/quality.mjs';
-import { deriveDocumentFlowBand } from '../src/document-flow-band.mjs';
+import { deriveDocumentFlowBand, adjacentSourceRuns } from '../src/document-flow-band.mjs';
 import { deriveNativeLinkMoves, deriveNativeFitRMoves, readLinkPageCharacters } from '../src/document-flow-links.mjs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -32,6 +32,17 @@ export function flowFixture({pages=3,foreign=false,mixed=true,denseAll=false,tab
  return new Uint8Array(Buffer.from(s));
 }
 const band={bodyTop:700,flowTop:700,floor:100,x0:50,x1:500};
+test('source paragraph splits require baseline, paint order and bounded same-line gaps',()=>{
+ const boxes={1:{x:204.987,y:205.001,w:5.608,h:5.68},2:{x:221.637,y:204.889,w:27.928,h:5.856},3:{x:221.581,y:195.366,w:31.968,h:5.856}};
+ const engine={objectBounds:h=>boxes[h]};
+ const a={baselines:[205.001],size:8,handles:[1],slots:[152]};
+ const b={baselines:[205.001,195.478],size:8,handles:[2,3],slots:[153,154]};
+ assert.equal(adjacentSourceRuns(engine,a,b),true);
+ assert.equal(adjacentSourceRuns(engine,a,{...b,baselines:[204.9,195.478]}),false);
+ assert.equal(adjacentSourceRuns(engine,a,{...b,slots:[151,154]}),false);
+ boxes[2]={...boxes[2],x:240};
+ assert.equal(adjacentSourceRuns(engine,a,b),false);
+});
 test('document planner uses existing destinations before terminal pages and preserves all line indices',()=>{
  const lines=Array.from({length:50},(_,i)=>({top:700-14*i,bottom:690-14*i,gap:14}));
  const pages=planDocumentLines(lines,[band,band],2);
