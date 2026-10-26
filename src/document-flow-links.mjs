@@ -89,7 +89,7 @@ function mapSourceGlyphs(sourceEngine,sourceBands,targetGlyphs,edits,expectedPag
   return {mapping,sources};
 }
 
-export function deriveNativeLinkMoves(sourceEngine,sourceBands,targetGlyphs,edits,model,expectedPageText) {
+export function deriveNativeLinkMoves(sourceEngine,sourceBands,targetGlyphs,edits,model,expectedPageText,authorizedTargets=new Set()) {
   if(!model||!model.annotations.some(a=>sourceBands.some(b=>b.sourcePageIndex===a.sourcePageIndex)))return [];
   const ids=sourceBands.map(b=>b.sourcePageIndex);
   const {mapping,sources}=mapSourceGlyphs(sourceEngine,sourceBands,targetGlyphs,edits,expectedPageText);
@@ -97,7 +97,7 @@ export function deriveNativeLinkMoves(sourceEngine,sourceBands,targetGlyphs,edit
   for(const descriptor of model.annotations.filter(a=>ids.includes(a.sourcePageIndex))){
     if(descriptor.eligible!==true||descriptor.kind!=='link')fail(descriptor.reason||'document_flow_annotation_unsupported');
     const targets=descriptor.internalDestinationSourcePageIndices||[descriptor.destination?.targetSourcePageIndex].filter(Number.isInteger);
-    if(targets.some(i=>ids.includes(i)))fail('document_flow_link_target_in_changed_body');
+    if(targets.some(i=>ids.includes(i)&&!authorizedTargets.has(i)))fail('document_flow_link_target_in_changed_body');
     const chars=sources.get(descriptor.sourcePageIndex),band=sourceBands.find(b=>b.sourcePageIndex===descriptor.sourcePageIndex);
     const [l,b,r,t]=descriptor.rect,rect={l,b,r,t};
     const owned=chars.filter(c=>c.box&&intersects(c.box,rect));
@@ -174,4 +174,16 @@ export function plannedLinkGlyphs(plan) {
 
 export function savedLinkGlyphs(engine,outputBands) {
   return outputBands.flatMap(b=>readLinkPageCharacters(engine,b.outputPageIndex).filter(c=>c.u>32&&bodyGlyph(c,b)).map(c=>({...c,outputPageIndex:b.outputPageIndex})));
+}
+
+// A page is eligible only if every reference to it has a corresponding FitR
+// descriptor. Missing or mixed destination forms remain a barrier.
+export function nativeFitRTargetPages(model, pages) {
+  return new Set(pages.filter(page => {
+    const refs=(model?.annotations||[]).filter(a=>(a.internalDestinationSourcePageIndices||[a.destination?.targetSourcePageIndex].filter(Number.isInteger)).includes(page));
+    return refs.length>0 && refs.every(a=>{
+      const ds=(a.internalDestinations||[]).filter(d=>d.targetSourcePageIndex===page);
+      return ds.length>0 && ds.every(d=>d.kind==='FitR' && d.id!==undefined);
+    });
+  }));
 }

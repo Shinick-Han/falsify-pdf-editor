@@ -353,3 +353,46 @@ test('internal target page stops an eligible text prefix and terminal tail prese
   for(let i=1;i<a.length;i++)assert.equal(b.get(i).toString(),a.get(i).toString());
  }finally{old.destroy();out.destroy();}
 });
+
+
+test('FitR target is proven against planned and saved glyphs and transported to its final page',annotationsReal,async()=>{
+ const original=await annotatedFixture({targetPage:1}), source=await runtime.engineFactory(original);
+ let rect;
+ try {
+  const chars=readLinkPageCharacters(source,1).filter(c=>c.u>32&&c.box&&c.box.b>80&&c.box.t<720);
+  const owned=chars.filter(c=>c.object===chars[0].object);
+  rect=[Math.min(...owned.map(c=>c.box.l)),Math.min(...owned.map(c=>c.box.b)),Math.max(...owned.map(c=>c.box.r)),Math.max(...owned.map(c=>c.box.t))];
+ } finally {source.close();}
+ const doc=new annotationRuntime.mupdf.PDFDocument(original);let sourceBytes;
+ try {
+  doc.getTrailer().get('Root').get('Dests').put('outsideTarget',[doc.findPage(1),'FitR',...rect]);
+  const b=doc.saveToBuffer('garbage=0,compress=false');try{sourceBytes=b.asUint8Array().slice();}finally{b.destroy();}
+ } finally {doc.destroy();}
+ const edits=[{id:'grow',pageIndex:0,before,after}], calls=[];
+ const adapter={...annotationRuntime.adapter,
+  async transport(args){calls.push({type:'transport',moves:structuredClone(args.destinationMoves)});return annotationRuntime.adapter.transport(args);},
+  async validate(args){calls.push({type:'validate',moves:structuredClone(args.destinationMoves)});return annotationRuntime.adapter.validate(args);}
+ };
+ const result=await editPdf({sourceBytes,edits,reflow:true},{documentFlow:true,engineFactory:runtime.engineFactory,annotationAdapter:adapter});
+ assert.equal(result.report.ok,true);
+ assert.equal(calls.length,2);assert.equal(calls[0].moves.length,1);assert.deepEqual(calls[0].moves,calls[1].moves);
+ const move=calls[0].moves[0];assert.equal(move.sourcePageIndex,1);assert.ok(Number.isInteger(move.outputPageIndex));assert.ok(Math.abs(move.dy)>.1);
+ const out=new annotationRuntime.mupdf.PDFDocument(result.pdf);try{
+  const dest=out.getTrailer().get('Root').get('Dests').get('outsideTarget');
+  assert.equal(dest.get(0).asIndirect(),out.findPage(move.outputPageIndex).asIndirect());
+  for(let i=0;i<4;i++)assert.ok(Math.abs(dest.get(i+2).asNumber()-(rect[i]+(i%2?move.dy:move.dx)))<.05);
+ }finally{out.destroy();}
+ const corrupt=new annotationRuntime.mupdf.PDFDocument(result.pdf);let damaged;
+ try {
+  const dest=corrupt.getTrailer().get('Root').get('Dests').get('outsideTarget');dest.put(2,dest.get(2).asNumber()+5);
+  const b=corrupt.saveToBuffer('garbage=0,compress=false');try{damaged=b.asUint8Array().slice();}finally{b.destroy();}
+ }finally{corrupt.destroy();}
+ const check=await inspectSavedPdf(runtime.engineFactory,sourceBytes,damaged,edits,{sourcePageMap:result.report.pagination.sourcePageMap,flowGroups:result.report.pagination.flowGroups,annotationAdapter:annotationRuntime.adapter});
+ assert.equal(check.ok,false);assert.equal(check.annotationCheck.ok,false);
+ const partial=new annotationRuntime.mupdf.PDFDocument(sourceBytes);let unsafe;
+ try{
+  const dest=partial.getTrailer().get('Root').get('Dests').get('outsideTarget');dest.put(2,rect[0]+1);
+  const b=partial.saveToBuffer('garbage=0,compress=false');try{unsafe=b.asUint8Array().slice();}finally{b.destroy();}
+ }finally{partial.destroy();}
+ await assert.rejects(editPdf({sourceBytes:unsafe,edits,reflow:true},{documentFlow:true,engineFactory:runtime.engineFactory,annotationAdapter:annotationRuntime.adapter}),e=>e.code==='LAYOUT_UNSUPPORTED');
+});

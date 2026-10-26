@@ -18,7 +18,7 @@
 import { createHash } from "node:crypto";
 import { resolvePageFraction } from "./continuation-template.mjs";
 import { deriveDocumentFlowBand } from "./document-flow-band.mjs";
-import { deriveNativeLinkMoves, savedLinkGlyphs } from "./document-flow-links.mjs";
+import { deriveNativeLinkMoves, deriveNativeFitRMoves, nativeFitRTargetPages, savedLinkGlyphs } from "./document-flow-links.mjs";
 import { verifySavedUnderlines } from "./document-flow-underlines.mjs";
 
 const TOL = 1;
@@ -761,8 +761,8 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
       annotationModel=await annotationAdapter.inspect({sourceBytes,sourceSha256:createHash('sha256').update(sourceBytes).digest('hex')});
       if(!annotationModel||!Array.isArray(annotationModel.annotations))throw new Error('document_flow_annotation_inventory_mismatch');
     }
-    const annotationMoves=[];
-    const grouped = inspectDocumentGroups(src, out, map, options.flowGroups ?? [], byPage, failures, warnings, !!options.includeText, annotationModel, annotationMoves);
+    const annotationMoves=[], destinationMoves=[];
+    const grouped = inspectDocumentGroups(src, out, map, options.flowGroups ?? [], byPage, failures, warnings, !!options.includeText, annotationModel, annotationMoves, destinationMoves);
     for (let i = 0; i < n; i++) {
       const m = map ? map[i] : { outputPageIndex: i, continuationPageIndices: [] };
       const s = readGlyphs(src, i);
@@ -819,7 +819,7 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
       }
     }
     if(annotationAdapter&&annotationModel){
-      const verified=await annotationAdapter.validate({model:annotationModel,sourceBytes,outputBytes,sourcePageMap:map,moves:annotationMoves,reflowedSourcePages:[...grouped.keys()]});
+      const verified=await annotationAdapter.validate({model:annotationModel,sourceBytes,outputBytes,sourcePageMap:map,moves:annotationMoves,destinationMoves,reflowedSourcePages:[...grouped.keys()]});
       if(verified?.ok!==true)failures.push({code:typeof verified?.code==='string'&&/^[a-z_]{1,64}$/.test(verified.code)?verified.code:'document_flow_annotation_verification_failed'});
       report.annotationCheck={ok:verified?.ok===true,moves:annotationMoves.length};
     }
@@ -835,7 +835,7 @@ export async function inspectSavedPdf(engineFactory, sourceBytes, outputBytes, e
   return report;
 }
 
-function inspectDocumentGroups(src, out, map, groups, byPage, failures, warnings, includeText, annotationModel=null, annotationMoves=[]) {
+function inspectDocumentGroups(src, out, map, groups, byPage, failures, warnings, includeText, annotationModel=null, annotationMoves=[], destinationMoves=[]) {
   const covered=new Map(), outputs=new Set();
   const bad=()=>failures.push({code:'document_flow_map_invalid'});
   if(!Array.isArray(groups)||groups.length>64){bad();return covered;}
@@ -867,7 +867,10 @@ function inspectDocumentGroups(src, out, map, groups, byPage, failures, warnings
         return ['bodyTop','flowTop','floor'].some(key=>!near(b[key],destination[key]))||!near(b.x0,expectedX0)||!near(b.x1,expectedX1);
       })) {bad();continue;}
     try {
-      const moves=deriveNativeLinkMoves(src,derived,savedLinkGlyphs(out,oo),[...byPage.values()].flat(),annotationModel,expectedPageText);
+      const glyphs=savedLinkGlyphs(out,oo), edits=[...byPage.values()].flat();
+      const destinations=deriveNativeFitRMoves(src,derived,glyphs,edits,annotationModel,expectedPageText);
+      destinationMoves.push(...destinations);
+      const moves=deriveNativeLinkMoves(src,derived,glyphs,edits,annotationModel,expectedPageText,nativeFitRTargetPages(annotationModel,ids));
       annotationMoves.push(...moves);
       verifySavedUnderlines(out,derived,oo,moves);
     }catch(error){failures.push({code:error?.code??'document_flow_link_mapping_failed',pageIndex:ids[0]});}
