@@ -8,6 +8,7 @@
 import { createHash } from "node:crypto";
 import { loadRuntime } from "./runtime.mjs";
 import { PAGINATION_CAPABILITY, PAGINATION_LIMITS, paginateOverflow } from "./pagination.mjs";
+import { compactDocumentFlow } from "./document-flow.mjs";
 import {
   LineRetentionError,
   canCommitLineLocal,
@@ -30,6 +31,12 @@ export const LIMITS = Object.freeze({
 export const EDITOR_CAPABILITIES = Object.freeze({
   reflow: true,
   pagination: PAGINATION_CAPABILITY,
+  documentFlow: Object.freeze({
+    supported: true, version: 1, optIn: true,
+    policies: Object.freeze(["strict", "compatible-groups"]),
+    scope: "bounded whole-body single-column text chains; original next pages first; tables, figures, annotations and ambiguous styles are barriers",
+    maxSourcePages: 64,
+  }),
   continuationStyle: Object.freeze({
     supported: true,
     policy: "source-number-suffix",
@@ -91,6 +98,7 @@ function paginationOptions(options) {
     throw new EditError("INVALID_REQUEST", msg);
   };
   const allow = options.allowPagination ?? true;
+  if (![undefined, false, true, "compatible-groups"].includes(options.documentFlow)) bad("documentFlow must be a boolean or compatible-groups");
   if (typeof allow !== "boolean") bad("allowPagination must be a boolean");
   const max = options.maxNewPages ?? PAGINATION_LIMITS.defaultMaxNewPages;
   if (!Number.isInteger(max) || max < 0 || max > PAGINATION_LIMITS.maxNewPages) bad(`maxNewPages must be an integer from 0 to ${PAGINATION_LIMITS.maxNewPages}`);
@@ -555,7 +563,7 @@ export async function editPdf(request, options = {}) {
 
   // Source page -> output pages. Downstream pages keep their content and
   // only shift by the continuation pages inserted before them.
-  const sourcePageMap = [];
+  let sourcePageMap = [];
   for (let s = 0, out = 0; s < sourcePageCount; s++) {
     const c = continued.get(s);
     const n = c?.added ?? 0;
@@ -565,19 +573,34 @@ export async function editPdf(request, options = {}) {
     sourcePageMap.push(entry);
     out += 1 + n;
   }
+  let flowGroups = [];
+  const documentFlowEnabled = options.documentFlow === true || options.documentFlow === 'compatible-groups';
+  if (documentFlowEnabled && added > 0) {
+    try {
+      const compacted = await compactDocumentFlow(engineFactory, sourceBytes, pdf, edits, sourcePageMap, pg.max, options.documentFlow === 'compatible-groups' ? 'compatible-groups' : 'strict');
+      pdf = compacted.pdf; sourcePageMap = compacted.sourcePageMap;
+      added = compacted.addedPages; flowGroups = compacted.flowGroups;
+      report.warnings.push(...(compacted.warnings ?? []));
+    } catch (err) {
+      throw fail("LAYOUT_UNSUPPORTED", "Document flow could not preserve the compatible text chain", {cause: err?.code ?? "document_flow_failed"});
+    }
+  }
   report.pagination = {
     enabled: pg.allow,
     maxNewPages: pg.max,
     pages: { source: sourcePageCount, output: sourcePageCount + added },
     addedPages: added,
     sourcePageMap,
+    flowGroups,
+    documentFlow: documentFlowEnabled,
+    documentFlowPolicy: options.documentFlow === 'compatible-groups' ? 'compatible-groups' : documentFlowEnabled ? 'strict' : 'disabled',
   };
 
   // Same-engine self-check on a freshly reopened copy.
   const qaCapture = captureConsole(!!options.includeEngineLog);
   let check;
   try {
-    check = await quality.inspectSavedPdf(engineFactory, sourceBytes, pdf, edits, { sourcePageMap, includeText: !!options.includeFlowText });
+    check = await quality.inspectSavedPdf(engineFactory, sourceBytes, pdf, edits, { sourcePageMap, flowGroups, includeText: !!options.includeFlowText });
   } catch (err) {
     report.selfCheck = { status: "error", error: err?.code ?? err?.name ?? "Error" };
     if (options.draft === true && readablePdf(pdf)) return finishDraft(report, pdf, sourceBytes, "SELF_CHECK_FAILED", "Saved-PDF self-check could not run");
