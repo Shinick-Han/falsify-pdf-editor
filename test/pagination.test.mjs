@@ -108,6 +108,7 @@ function pdfEngineFor(docs) {
         _FPDFText_LoadPage: (p) => p, _FPDFText_ClosePage() {},
         _FPDFText_CountChars: (p) => doc[p - 1].length,
         _FPDFText_GetUnicode: (p, i) => doc[p - 1][i][0].charCodeAt(0),
+        _FPDFText_IsGenerated: (p, i) => doc[p - 1][i][3] ? 1 : 0,
         _FPDFText_GetCharBox: (p, i) => {
           const [, x, y] = doc[p - 1][i];
           heap[0] = x; heap[1] = x + 6; heap[2] = y; heap[3] = y + 10;
@@ -297,4 +298,26 @@ test("pagination binds a unique short inline underline but refuses table rules a
   assert.equal(plan().code,"pagination_unsupported_foreign_object_in_flow");
   objects[1].b.w=10;objects[1].b.h=3;
   assert.equal(plan().code,"pagination_unsupported_foreign_object_in_flow");
+});
+
+
+test("saved whole logical paragraph compares generated spaces across continuation without accepting a visible hyphen or typed space", async () => {
+  const src=new Uint8Array([21]),out=new Uint8Array([22]);
+  const edits=[{id:"whole",pageIndex:0,before:"trial,routinely beneficial delta",after:"trial,routinely beneficial qualified delta"}];
+  const source=[[...body(["trial,routinely ben\u0002eficial", "delta"]),...footer],line("other page",50,700)];
+  const inspect=async (text, generated) => {
+    const rows=[...line(text,50,700).map((c,i)=>[c[0],50+i*5,c[2]]),br];
+    const added=rows.find((c,i) => i>0 && rows[i-1][0]==="," && c[0]===" ");
+    if (added) added[3]=generated;
+    const docs=new Map([[src,source],[out,[[...rows,...footer],body(["delta"]),line("other page",50,700)]]]);
+    return inspectSavedPdf(pdfEngineFor(docs),src,out,edits,{sourcePageMap:mapFor([1])});
+  };
+  const good=await inspect("trial, routinely beneficial qualified",true);
+  assert.equal(good.ok,true,JSON.stringify(good.failures));
+  assert.equal(good.pages[0].generated_whitespace_normalized,true);
+  assert.ok(good.warnings.some(w=>w.code==="continued_flow_generated_whitespace_normalized"));
+  for (const [text,generated] of [["trial, routinely beneficial qualified",false],["trial, routinely ben-eficial qualified",true],["trial, routinely qualified beneficial",true]]) {
+    const bad=await inspect(text,generated);
+    assert.ok(bad.failures.some(f=>f.code==="edited_flow_text_or_order_mismatch"),text);
+  }
 });

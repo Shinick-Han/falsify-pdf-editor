@@ -346,3 +346,15 @@ test("an unchanged edge band with a page model passes", async () => {
   assert.equal(r.ok, true, JSON.stringify(r.failures));
   assert.equal(r.pages[0].edge_stable, true);
 });
+
+
+test("generated extraction spaces may differ in a whole logical After; typed spaces and visible hyphens remain exact", async () => {
+  const { matchesGeneratedWhitespace } = await import("../src/quality.mjs");
+  const extracted = (s) => [...s].map(ch => ({u:ch==="~"?32:ch.charCodeAt(0),generated:ch==="~"}));
+  assert.equal(matchesGeneratedWhitespace("trial,routinely effectswere",extracted("trial,~routinely effects~were")),true);
+  assert.equal(matchesGeneratedWhitespace("trial,routinely",extracted("trial, routinely")),false);
+  assert.equal(matchesGeneratedWhitespace("beneficial",extracted("ben-~eficial")),false);
+  assert.equal(matchesGeneratedWhitespace("effects were",extracted("effectswere")),false);
+  assert.equal(matchesGeneratedWhitespace("alpha beta",extracted("beta alpha")),false);
+  assert.equal(matchesGeneratedWhitespace("value - 3",extracted("value~3")),false);
+});
